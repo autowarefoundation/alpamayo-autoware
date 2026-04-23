@@ -28,7 +28,11 @@ Camera Topics (CompressedImage × 4)     Odometry Topic
          Trajectory    CoT Text     Markers
 ```
 
-Image preprocessing runs entirely on GPU via `torchvision.io.decode_jpeg` + `F.interpolate`.
+Image preprocessing runs entirely on GPU: `torchvision.io.decode_jpeg` →
+`F.interpolate` → `Qwen2VLImageProcessorFast(device="cuda")`. The
+GPU-resident path keeps uint8 pixels on device through normalize +
+patchify, eliminating a ~20 MB/inference round-trip to host memory and
+running the image-processor's normalize+patchify on GPU.
 
 ### Performance
 
@@ -36,11 +40,19 @@ Benchmarked on NVIDIA RTX PRO 6000 (96 GB, SM120) with 4 cameras × 4 temporal f
 
 | Configuration | Latency | FPS | Trajectory Deviation |
 |---------------|---------|-----|----------------------|
-| Original (CPU preproc, sampling, native, 10-step) | 1.018s | 1.0 | Reference |
-| GPU preproc + greedy + native expert + 10-step | 0.862s | 1.2 | ~0% |
-| GPU preproc + greedy + native expert + 5-step | 0.768s | 1.3 | ~0.9% |
-| GPU preproc + greedy + TRT expert + 10-step | 0.751s | 1.3 | ~0.3% |
-| **Full optimized** (GPU + greedy + TRT + 5-step) | **0.714s** | **1.4** | **~1.2%** |
+| Original (CPU preproc, sampling, native, 10-step) | 1.018s | 0.98 | Reference |
+| GPU preproc + greedy + native expert + 10-step | 0.862s | 1.16 | ~0% |
+| GPU preproc + greedy + native expert + 5-step | 0.768s | 1.30 | ~0.9% |
+| GPU preproc + greedy + TRT expert + 10-step | 0.751s | 1.33 | ~0.3% |
+| GPU preproc + greedy + TRT expert + 5-step | 0.714s | 1.40 | ~1.2% |
+| **Full optimized** (GPU-resident preproc + greedy + TRT + 5-step) | **0.644s** | **1.55** | **~1.2%** |
+
+The last row adds two free-meal changes on top of the previous row:
+(a) the image processor's normalize+patchify runs on GPU via
+`apply_chat_template(device="cuda")` instead of a CPU round-trip, and
+(b) `generation_config.output_logits = False` drops ~20 MB/token of
+unused host-pinned VLM logits. Same VLM/expert/diffusion math, so
+trajectory deviation is unchanged from the previous row.
 
 ### Modes
 

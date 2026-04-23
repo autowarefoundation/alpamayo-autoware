@@ -222,24 +222,29 @@ class AlpamayoRosNode(Node):
     def _run_inference(self, payload: dict) -> dict:
         start = time.time()
 
-        # GPU JPEG decode + GPU batch resize
+        # GPU JPEG decode + GPU batch resize. Keep uint8 on GPU all the way
+        # through the processor — ``.cpu()`` here would round-trip ~20 MB per
+        # inference and push normalize+patchify onto the CPU fast-path
+        # (~58 ms/frame instead of ~0.7 ms/frame on GPU).
         decoded = []
         for jpeg_buf in payload["jpeg_buffers"]:
             decoded.append(torchvision.io.decode_jpeg(jpeg_buf, device="cuda"))
-        stacked = torch.stack(decoded)  # [N, 3, H, W] on GPU
-        resized = torch.nn.functional.interpolate(
-            stacked.float(), size=(560, 1008), mode="bicubic", align_corners=False
-        )
-        resized_cpu = resized.clamp(0, 255).to(torch.uint8).cpu()
+        stacked = torch.stack(decoded)  # [N, 3, H, W] uint8 on GPU
+        if stacked.shape[-2:] != (560, 1008):
+            stacked = torch.nn.functional.interpolate(
+                stacked.float(), size=(560, 1008), mode="bicubic", align_corners=False,
+            ).clamp(0, 255).to(torch.uint8)
 
         n_cams = len(self._camera_topics)
         camera_per_cam = [
-            resized_cpu[i * self._num_frames : (i + 1) * self._num_frames]
+            stacked[i * self._num_frames : (i + 1) * self._num_frames]
             for i in range(n_cams)
         ]
-        image_frames = torch.stack(camera_per_cam)  # [n_cams, n_frames, 3, H, W]
+        image_frames = torch.stack(camera_per_cam)  # [n_cams, n_frames, 3, H, W] on GPU
 
         messages = helper.create_message(image_frames.flatten(0, 1))
+        # device="cuda" makes Qwen2VLImageProcessorFast run normalize + patchify
+        # on GPU (~0.7 ms/frame vs ~58 ms/frame on the CPU fast-path).
         processor_inputs = self._processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -247,7 +252,15 @@ class AlpamayoRosNode(Node):
             continue_final_message=True,
             return_dict=True,
             return_tensors="pt",
+            device="cuda",
         )
+        # apply_chat_template(device=cuda) only puts pixel_values on GPU; text
+        # ids / attention_mask / image_grid_thw still come back on CPU. Move
+        # them once so the forward does not hit per-tensor sync waits.
+        processor_inputs = {
+            k: v.to(self._device) if hasattr(v, "to") else v
+            for k, v in processor_inputs.items()
+        }
         model_inputs = {
             "tokenized_data": processor_inputs,
             "ego_history_xyz": payload["ego_history_xyz"],

@@ -182,7 +182,10 @@ class AlpamayoR1(ReasoningVLA):
         generation_config.do_sample = True
         generation_config.num_return_sequences = num_traj_samples
         generation_config.max_new_tokens = max_generation_length
-        generation_config.output_logits = True
+        # Downstream consumers read sequences / past_key_values / rope_deltas
+        # only — per-step logits are [B, max_gen, ~156k vocab] ≈ 20 MB/token of
+        # pure waste on the host-pinned output buffer.
+        generation_config.output_logits = False
         generation_config.return_dict_in_generate = True
         generation_config.top_k = top_k
         generation_config.pad_token_id = self.tokenizer.pad_token_id
