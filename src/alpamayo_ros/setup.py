@@ -27,6 +27,7 @@ setup(
     entry_points={
         "console_scripts": [
             "alpamayo_node = alpamayo_ros.alpamayo_node:main",
+            "dp_stack_trajectory_porter = alpamayo_ros.dp_stack_trajectory_porter:main",
         ],
     },
 )

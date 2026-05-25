@@ -3,7 +3,7 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
-    """Launch Alpamayo node that listens to live camera + odometry topics."""
+    """Launch Alpamayo inference and the diffusion-planner trajectory porter."""
     # Camera topics and their corresponding camera indices:
     # 0=Front left, 1=Front, 2=Front right, 3=Rear left, 4=Rear, 5=Rear right, 6=Front telephoto
     default_camera_topics = [
@@ -32,6 +32,21 @@ def generate_launch_description() -> LaunchDescription:
                         "inference_period_sec": 1.0,
                     }
                 ],
-            )
+            ),
+            Node(
+                package="alpamayo_ros",
+                executable="dp_stack_trajectory_porter",
+                name="dp_stack_trajectory_porter",
+                output="screen",
+                parameters=[
+                    {
+                        "input_trajectory_topic": "/alpamayo/predicted_trajectory",
+                        "output_trajectories_topic": (
+                            "/planning/generator/diffusion_planner/modified_candidate_trajectories"
+                        ),
+                        "kinematic_state_topic": "/localization/kinematic_state",
+                    }
+                ],
+            ),
         ]
     )
