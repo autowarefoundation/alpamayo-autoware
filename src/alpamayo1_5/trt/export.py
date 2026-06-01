@@ -1,19 +1,19 @@
+"""ONNX export of Alpamayo's expert denoiser step.
+
+The exported (FP16/BF16) ONNX is the input to the FP8 quantization +
+TensorRT-engine build in ``export_fp8`` / ``trt_fp8_runtime``. The expert must
+run with **eager** attention before export (flash-attention is not
+ONNX-exportable) — the build script sets
+``model.expert.config._attn_implementation = "eager"``.
+"""
+
 from __future__ import annotations
 
-import importlib
-import tempfile
 from pathlib import Path
 from typing import Any
 
 import onnx
 import torch
-from onnxruntime.quantization import (
-    CalibrationDataReader,
-    CalibrationMethod,
-    QuantFormat,
-    QuantType,
-    quantize_static,
-)
 from transformers.cache_utils import DynamicCache
 
 from alpamayo1_5.trt.common import (
@@ -21,7 +21,6 @@ from alpamayo1_5.trt.common import (
     flatten_past_key_values,
     legacy_cache_from_prompt_cache,
     past_key_value_input_names,
-    resolve_artifact_dir,
 )
 
 
@@ -82,36 +81,10 @@ class ExpertDenoiserExportModule(torch.nn.Module):
         return pred.to(dtype=self.expert_dtype)
 
 
-class TensorFileCalibrationReader(CalibrationDataReader):
-    """A lazy calibration reader that streams torch-saved tensor dicts from disk."""
-
-    def __init__(self, sample_paths: list[Path]):
-        self.sample_paths = sample_paths
-        self._iterator = iter(self.sample_paths)
-
-    def get_next(self) -> dict[str, Any] | None:
-        try:
-            sample_path = next(self._iterator)
-        except StopIteration:
-            return None
-        sample = torch.load(sample_path, map_location="cpu", weights_only=False)
-        return {
-            key: value.cpu().numpy() if isinstance(value, torch.Tensor) else value
-            for key, value in sample.items()
-        }
-
-    def rewind(self) -> None:
-        self._iterator = iter(self.sample_paths)
-
-
 def load_calibration_sample(sample_path: str | Path, device: torch.device) -> dict[str, torch.Tensor]:
     """Load a captured denoiser sample to a target device."""
     sample = torch.load(Path(sample_path), map_location="cpu", weights_only=False)
-    loaded: dict[str, torch.Tensor] = {}
-    for key, value in sample.items():
-        if isinstance(value, torch.Tensor):
-            loaded[key] = value.to(device=device)
-    return loaded
+    return {k: v.to(device=device) for k, v in sample.items() if isinstance(v, torch.Tensor)}
 
 
 def export_expert_denoiser_onnx(
@@ -120,17 +93,14 @@ def export_expert_denoiser_onnx(
     output_path: str | Path,
     opset_version: int = 18,
 ) -> Path:
-    """Export Alpamayo's expert denoiser step to ONNX."""
+    """Export Alpamayo's expert denoiser step to ONNX (external data)."""
     export_module = ExpertDenoiserExportModule(model).eval().to(device=sample["x"].device)
     output_path = Path(output_path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     past_key_values = legacy_cache_from_prompt_cache(
         tuple(
-            (
-                sample[f"past_key_{layer_idx:02d}"],
-                sample[f"past_value_{layer_idx:02d}"],
-            )
+            (sample[f"past_key_{layer_idx:02d}"], sample[f"past_value_{layer_idx:02d}"])
             for layer_idx in range(export_module.num_hidden_layers)
         )
     )
@@ -165,131 +135,3 @@ def export_expert_denoiser_onnx(
     )
     onnx.checker.check_model(str(output_path))
     return output_path
-
-
-def discover_nodes_to_exclude(model_path: str | Path) -> list[str]:
-    """Exclude small projection heads from INT8 quantization for better fidelity."""
-    model = onnx.load(Path(model_path), load_external_data=False)
-    excluded_prefixes = ("action_in_proj", "action_out_proj")
-    excluded = []
-    for node in model.graph.node:
-        if any(prefix in node.name for prefix in excluded_prefixes):
-            excluded.append(node.name)
-    return excluded
-
-
-def apply_smoothquant_to_expert_denoiser(
-    source_model_path: str | Path,
-    output_model_path: str | Path,
-    calibration_sample_paths: list[Path],
-    smoothquant_alpha: float,
-    execution_provider: str,
-) -> tuple[Path, list[str]]:
-    """Apply SmoothQuant with an explicit ORT execution provider."""
-    try:
-        importlib.import_module("neural_compressor.adaptor.ox_utils.smooth_quant")
-    except Exception as exc:
-        raise RuntimeError(
-            "neural-compressor is not correctly installed. Please check your environment."
-        ) from exc
-
-    from neural_compressor.adaptor.ox_utils.smooth_quant import ORTSmoothQuant
-
-    source_model_path = Path(source_model_path).expanduser().resolve()
-    output_model_path = Path(output_model_path).expanduser().resolve()
-    output_model_path.parent.mkdir(parents=True, exist_ok=True)
-
-    original_model = onnx.load(source_model_path, load_external_data=False)
-    original_node_names = {node.name for node in original_model.graph.node}
-
-    def dataloader():
-        reader = TensorFileCalibrationReader(calibration_sample_paths)
-        for sample in reader:
-            yield sample, None
-
-    smoothquant = ORTSmoothQuant(
-        str(source_model_path),
-        dataloader(),
-        reduce_range=False,
-        backend=execution_provider,
-    )
-    smoothed_model = smoothquant.transform(
-        alpha=smoothquant_alpha,
-        folding=True,
-        calib_iter=max(1, len(calibration_sample_paths)),
-    )
-    smoothed_model.save(str(output_model_path))
-
-    smoothed_node_names = {node.name for node in smoothed_model.model.graph.node}
-    inserted_nodes = sorted(smoothed_node_names - original_node_names)
-    return output_model_path, inserted_nodes
-
-
-def quantize_expert_denoiser_int8(
-    source_model_path: str | Path,
-    int8_model_path: str | Path,
-    calibration_sample_paths: list[Path],
-    calibration_method: CalibrationMethod = CalibrationMethod.Entropy,
-    smoothquant_alpha: float = 0.6,
-    smoothquant_provider: str = "CUDAExecutionProvider",
-    calibration_providers: list[str] | None = None,
-) -> Path:
-    """Apply selective INT8 QDQ quantization to the exported denoiser graph."""
-    reader = TensorFileCalibrationReader(calibration_sample_paths)
-    nodes_to_exclude = set(discover_nodes_to_exclude(source_model_path))
-    calibration_providers = calibration_providers or [
-        "CUDAExecutionProvider",
-        "CPUExecutionProvider",
-    ]
-    common_options = {
-        "ActivationSymmetric": True,
-        "WeightSymmetric": True,
-        "CalibTensorRangeSymmetric": True,
-        "DedicatedQDQPair": True,
-        "MatMulConstBOnly": True,
-        "CalibMaxIntermediateOutputs": 32,
-    }
-
-    with tempfile.TemporaryDirectory(prefix="alpamayo.smoothquant.") as temp_dir:
-        smoothquant_model_path, inserted_nodes = apply_smoothquant_to_expert_denoiser(
-            source_model_path=source_model_path,
-            output_model_path=Path(temp_dir) / "expert_step.smoothquant.onnx",
-            calibration_sample_paths=calibration_sample_paths,
-            smoothquant_alpha=smoothquant_alpha,
-            execution_provider=smoothquant_provider,
-        )
-        nodes_to_exclude.update(inserted_nodes)
-
-        quantize_static(
-            model_input=str(smoothquant_model_path),
-            model_output=str(int8_model_path),
-            calibration_data_reader=reader,
-            quant_format=QuantFormat.QDQ,
-            op_types_to_quantize=["MatMul", "Gemm"],
-            per_channel=True,
-            reduce_range=False,
-            activation_type=QuantType.QInt8,
-            weight_type=QuantType.QInt8,
-            nodes_to_exclude=sorted(nodes_to_exclude),
-            use_external_data_format=True,
-            calibrate_method=calibration_method,
-            calibration_providers=calibration_providers,
-            extra_options=common_options,
-        )
-    return Path(int8_model_path).expanduser().resolve()
-
-
-def initialize_artifact_layout(output_dir: str | Path) -> dict[str, Path]:
-    """Create a conventional artifact layout for TRT export outputs."""
-    artifact_dir = resolve_artifact_dir(output_dir)
-    layout = {
-        "artifact_dir": artifact_dir,
-        "calibration_dir": artifact_dir / "calibration",
-        "engine_cache_dir": artifact_dir / "engine_cache",
-        "fp32_onnx": artifact_dir / "expert_step.fp32.onnx",
-        "int8_onnx": artifact_dir / "expert_step.int8.qdq.onnx",
-        "manifest": artifact_dir / "manifest.json",
-    }
-    layout["calibration_dir"].mkdir(parents=True, exist_ok=True)
-    layout["engine_cache_dir"].mkdir(parents=True, exist_ok=True)
-    return layout

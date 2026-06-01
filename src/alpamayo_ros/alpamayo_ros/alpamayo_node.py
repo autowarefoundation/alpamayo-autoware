@@ -73,18 +73,14 @@ class AlpamayoRosNode(Node):
         # ~94 ms / inference (3 saved step_fn calls); adaptive_flow caches
         # the middle steps on top of that.
         self.declare_parameter("num_diffusion_steps", 5)
-        # Greedy decode yields a single deterministic trajectory with ~0%
-        # deviation vs nucleus on a fixed bag. Set False to use the nucleus
-        # preset (top_p=0.98 / temperature=0.6) below.
-        self.declare_parameter("use_greedy_decode", True)
         self.declare_parameter("top_p", 0.98)
         self.declare_parameter("temperature", 0.6)
         self.declare_parameter("max_generation_length", 64)
-        # Optional TRT FP16 expert engine. Empty string → use the native
-        # PyTorch denoiser step. Set to an ONNX file produced by
-        # ``scripts/build_trt_expert_engine.py`` to swap in a TrtExpertEngine
-        # runtime for the 5-step diffusion inner loop.
-        self.declare_parameter("expert_onnx_path", "")
+        # Optional FP8 TRT expert engine. Empty string → use the native PyTorch
+        # denoiser step. Set to a serialized ``.engine`` file produced by
+        # ``scripts/build_trt_expert_engine.py`` to swap in a TrtFp8ExpertEngine
+        # for the diffusion inner loop (~2x faster on Blackwell).
+        self.declare_parameter("expert_engine_path", "")
 
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
@@ -195,20 +191,15 @@ class AlpamayoRosNode(Node):
         )
         self._model.eval()
 
-        # Optional TRT FP16 expert engine — swap in if expert_onnx_path set
+        # Optional FP8 TRT expert engine — swap in if expert_engine_path is set
         # and the file exists. Falls back silently to native PyTorch otherwise.
-        expert_onnx = str(self.get_parameter("expert_onnx_path").value or "")
-        if expert_onnx and Path(expert_onnx).exists():
-            from alpamayo1_5.trt.expert_runtime import TrtExpertEngine
+        expert_engine = str(self.get_parameter("expert_engine_path").value or "")
+        if expert_engine and Path(expert_engine).exists():
+            from alpamayo1_5.trt.trt_fp8_runtime import TrtFp8ExpertEngine
 
-            engine = TrtExpertEngine(
-                onnx_model_path=expert_onnx,
-                engine_cache_dir=str(Path(expert_onnx).parent / "engine_cache"),
-                enable_int8=False,
-                enable_fp16=True,
-            )
+            engine = TrtFp8ExpertEngine(expert_engine, device=str(self._device))
             self._model.set_expert_step_runner(engine)
-            self.get_logger().info(f"TRT Expert loaded: {expert_onnx}")
+            self.get_logger().info(f"FP8 TRT Expert loaded: {expert_engine}")
         else:
             self.get_logger().info("TRT Expert: off (native PyTorch denoiser).")
 
@@ -218,17 +209,8 @@ class AlpamayoRosNode(Node):
         self._model.diffusion.num_inference_steps = num_steps
         self.get_logger().info(f"Diffusion inference steps: {num_steps}")
 
-        # Cache greedy/sampling config for the per-call generation.
-        self._use_greedy = bool(self.get_parameter("use_greedy_decode").value)
-        if self._use_greedy:
-            self._top_p, self._temperature = 1.0, 1.0
-            self.get_logger().info("Generation: GREEDY (top_p=1.0, temperature=1.0)")
-        else:
-            self._top_p = float(self.get_parameter("top_p").value)
-            self._temperature = float(self.get_parameter("temperature").value)
-            self.get_logger().info(
-                f"Generation: NUCLEUS (top_p={self._top_p}, temperature={self._temperature})"
-            )
+        self._top_p = float(self.get_parameter("top_p").value)
+        self._temperature = float(self.get_parameter("temperature").value)
         self._max_gen_len = int(self.get_parameter("max_generation_length").value)
 
         self._processor = helper.get_processor(self._model.tokenizer)

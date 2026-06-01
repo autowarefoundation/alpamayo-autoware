@@ -18,7 +18,7 @@ Camera Topics (CompressedImage × 4)     Odometry Topic
 │                                  KV Cache           │
 │                                       │             │
 │                          Expert Denoiser            │
-│                    (native PyTorch or TRT FP16)     │
+│                    (native PyTorch or TRT FP8)      │
 │                                       │             │
 │                          Trajectory Decode          │
 └──────────────────────────┬──────────────────────────┘
@@ -39,35 +39,43 @@ incurred.
 | Mode | Expert | Decode | Diffusion | Use case |
 |------|--------|--------|-----------|----------|
 | **Baseline** | PyTorch native | Nucleus (top_p=0.98) | 10 steps | Reference quality |
-| **Optimized** (default) | TRT FP16 engine | Greedy | 5–10 steps | Low-latency deployment |
+| **Optimized** (default) | TRT FP8 engine | Nucleus (top_p=0.98) | 5–10 steps | Low-latency deployment |
 
-Defaults are tuned for the optimized mode: 5-step diffusion +
-greedy decode + `output_logits = False` on the VLM rollout. Flip
-`num_diffusion_steps:=10` / `use_greedy_decode:=false` to reproduce
-the baseline quality profile.
+Defaults are tuned for the optimized mode (5-step diffusion + nucleus
+sampling); set `num_diffusion_steps:=10` for the baseline quality profile.
 
 ### Performance
 
-Benchmarked on NVIDIA RTX PRO 6000 (96 GB, SM120) with 4 cameras × 4 temporal frames at 1080×1920.
+Benchmarked on NVIDIA RTX PRO 6000 Blackwell (96 GB, sm_120).
 
-Latency is measured end-to-end by replaying a Tier IV rosbag through
-the ROS 2 node (`rate=0.5`, `max_generation_length=16`, 120 s warmup);
-medians are taken over 15+ per-inference samples from the node's
-`Alpamayo inference completed in X.XXs` log lines. Trajectory
-Deviation is `minADE / ground-truth path length` measured over
-`num_traj_samples=6` on the Physical AI AV clip used for TRT
-calibration (`030c760c-ae38-49aa-9ad8-f5650a545d26 @ t0_us=5_100_000`,
-GT path length = 46.64 m), same methodology as
-`src/alpamayo1_5/test_inference.py`.
+**Expert denoiser step** (the diffusion inner loop, run `num_diffusion_steps`
+times per inference) — single-step latency, verified against the native
+PyTorch expert on the calibration clip:
+
+| Expert runtime | per-step latency | speedup | engine size | max&#124;Δ&#124; trajectory vs PyTorch |
+|---|---|---|---|---|
+| PyTorch (bf16) | 14.8 ms | 1.0× | — | — |
+| TRT FP16 | 9.1 ms | 1.6× | 4.57 GB | 0.016 |
+| **TRT FP8** (default) | **7.3 ms** | **2.0×** | **2.29 GB** | 0.023 |
+
+Chain-of-thought text is byte-identical between native and FP8 runs.
+
+**End-to-end** (full `sample_trajectories_from_data_with_vlm_rollout` = VLM
+rollout + diffusion), matching the ROS-node config: 4 cameras × 4 frames @
+560×1008, nucleus sampling, `max_generation_length=16`, `num_traj_samples=1`
+(latency) / `=6` for the minADE-deviation column; calibration clip, GT path
+46.64 m; latency = median of 8 model-inference runs (excludes ROS messaging):
 
 | Configuration | Latency | FPS | Trajectory Deviation |
 |---------------|---------|-----|----------------------|
-| Original (CPU preproc, sampling, native, 10-step) | 0.820s | 1.22 | Reference |
-| GPU preproc + greedy + native expert + 10-step | 0.820s | 1.22 | ~0.4% |
-| GPU preproc + greedy + native expert + 5-step | 0.720s | 1.39 | ~0.4% |
-| GPU preproc + greedy + TRT expert + 10-step | 0.700s | 1.43 | ~1.3% |
-| GPU preproc + greedy + TRT expert + 5-step | 0.660s | 1.52 | ~1.8% |
-| **Full optimized** (GPU-resident preproc + greedy + TRT + 5-step) | **0.600s** | **1.67** | **~1.8%** |
+| native expert + 10-step | 0.717s | 1.40 | ~0.9% |
+| FP8 expert + 10-step | 0.628s | 1.59 | ~0.9% |
+| native expert + 5-step | 0.635s | 1.57 | ~0.7% |
+| **FP8 expert + 5-step** (default) | **0.595s** | **1.68** | **~1.0%** |
+
+FP8 saves ~40–90 ms (6–12%) end-to-end; the rollout is VLM-dominated, so the
+gain is smaller than the 2× per-step speedup. Deviation is statistically equal
+between native and FP8.
 
 ## Prerequisites
 
@@ -125,28 +133,38 @@ ros2 launch alpamayo_ros alpamayo.launch.py
 
 ### Optimized Mode (TRT Expert)
 
-The TRT engine build requires `physical_ai_av` for calibration data, which needs Python >= 3.11. ROS 2 Humble ships Python 3.10 and cannot install this package. Use a **separate Python 3.12 venv** for building the engine, then use the exported ONNX file in the ROS 2 (3.10) runtime environment.
+The FP8 expert engine is **built in a container** (one-time), then loaded by the
+**native** ROS 2 node. Docker is used *only* to build the `.engine` — the node
+runs outside Docker as usual. The container pins the finicky build stack (CUDA-13
+torch, ModelOpt, TensorRT) and loads the model with sdpa/eager attention so it
+needs **no flash-attn** (no source compile) — a fresh machine reproduces it with
+one command.
 
-**Step 1: Build engine** (Python 3.12 venv, one-time):
+**Step 1: Build the engine** (Docker; the `docker run` needs the GPU +
+nvidia-container-toolkit):
 
 ```bash
-uv venv .venv-trt --python python3.12
-source .venv-trt/bin/activate
-uv pip install -r scripts/requirements-trt-build.txt
-
-python3 scripts/build_trt_expert_engine.py --output-dir /path/to/your/engines
+docker build -f scripts/Dockerfile.trt-build -t alpamayo-trt-build .
+docker run --gpus all -e HF_TOKEN=$HF_TOKEN -v ~/autoware_data:/data \
+  alpamayo-trt-build \
+  python scripts/build_trt_expert_engine.py --output-dir /data/alpamayo/v0.1
+# -> ~/autoware_data/alpamayo/v0.1/expert_step.fp8.engine
 ```
 
-The script exports `expert_step.int8.qdq.onnx` and caches the compiled TRT engine under `engine_cache/` in the same directory.
-
-**Step 2: Run node** (Python 3.10, ROS 2 Humble):
+**Step 2: Run the node** (native, ROS 2 Humble / Python 3.10 — outside Docker):
 
 ```bash
 ros2 launch alpamayo_ros alpamayo.launch.py \
-  expert_onnx_path:=/path/to/your/engines/expert_step.int8.qdq.onnx \
-  num_diffusion_steps:=5 \
-  use_greedy_decode:=true
+  expert_engine_path:=~/autoware_data/alpamayo/v0.1/expert_step.fp8.engine \
+  num_diffusion_steps:=5
 ```
+
+On top of the usual model deps, the node's runtime needs a **compatible
+`tensorrt` (+ torch)** to deserialize the engine — but not the build-only quant
+tooling (ModelOpt, onnx). The VLM still runs `flash_attention_2`, so the ROS env
+also needs flash-attn (install a **prebuilt wheel** — do not source-compile it).
+A TRT engine is not portable across TensorRT major versions, so build and runtime
+must use the same TensorRT major.
 
 ### Rosbag Replay Evaluation
 
@@ -171,9 +189,8 @@ ros2 bag play <bag_path> --clock --rate 0.5
 | `cot_with_stamped_topic` | `/alpamayo/reasoning_stamped` | Timestamped reasoning topic |
 | `nav_text_topic` | `/alpamayo/nav_text` | Navigation text topic |
 | `inference_period_sec` | `0.1` | Inference trigger period |
-| `expert_onnx_path` | `""` | TRT expert ONNX path (empty = native PyTorch) |
+| `expert_engine_path` | `""` | FP8 TRT expert `.engine` path (empty = native PyTorch) |
 | `num_diffusion_steps` | `5` | Diffusion steps (10 = quality, 5 = speed) |
-| `use_greedy_decode` | `true` | Greedy decode (faster, deterministic) |
 | `top_p` | `0.98` | Nucleus sampling threshold |
 | `temperature` | `0.6` | Sampling temperature |
 | `max_generation_length` | `64` | VLM token budget per tick |
@@ -191,15 +208,17 @@ ros2 bag play <bag_path> --clock --rate 0.5
 
 ## TRT Expert Engine Build
 
-The `scripts/build_trt_expert_engine.py` script exports the expert denoiser to ONNX, applies SmoothQuant + INT8 quantization, and compiles a TensorRT engine:
+`scripts/build_trt_expert_engine.py` exports the expert denoiser to ONNX, applies
+NVIDIA ModelOpt **FP8** calibration + Q/DQ insertion, and compiles a
+STRONGLY_TYPED TensorRT engine (`expert_step.fp8.engine`). Key options:
+`--num-calibration-samples`, `--max-generation-length`, `--workspace-gb`,
+`--skip-validation`.
 
-```bash
-python3 scripts/build_trt_expert_engine.py --help
-```
-
-Key options: `--num-calibration-samples`, `--calibration-method`, `--smoothquant-alpha`, `--skip-validation`.
-
-Requires the `trt` dependency group: `uv sync --active --group trt`
+The build environment (build-time only — separate from the ROS runtime) is the
+container `scripts/Dockerfile.trt-build`, pinned via `scripts/trt-build.lock.txt`
+(it pulls a fixed CUDA-13 base and installs torch from the CUDA-13 index; the
+build uses sdpa attention so it needs no flash-attn). See
+[Optimized Mode](#optimized-mode-trt-expert) above for the build + run commands.
 
 ## Troubleshooting
 

@@ -1,0 +1,21 @@
+# Keep the Docker build context small — the image installs its own pinned env.
+# Local venvs (multi-GB) must never be sent as build context.
+.venv/
+.venv-trt/
+a1_5_venv/
+*venv*/
+
+.git/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Heavy / build-time-irrelevant
+images/
+notebooks/
+artifacts/
+*.engine
+*.onnx
+*.pt
+*.pb
+**/*.egg-info/

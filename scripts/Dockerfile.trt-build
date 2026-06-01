@@ -1,0 +1,61 @@
+# BUILD-ONLY image for producing the FP8 TRT expert engine.
+#
+# This container ONLY builds the `expert_step.fp8.engine` artifact (a serialized
+# TensorRT engine). The ROS 2 node runs OUTSIDE Docker, natively, and just loads
+# that .engine via `expert_engine_path`. The build-time deps (ModelOpt, onnx,
+# TensorRT) are never needed at ROS runtime.
+#
+# A fixed CUDA 13 base removes the system-library variance that made this hard to
+# reproduce on a fresh machine (cuDNN mismatch, CUDA toolchain). The build loads
+# the model with sdpa/eager attention, so there is NO flash-attn — and hence no
+# slow, RAM-hungry source compile (pure pip install).
+#
+# 1) Build the image (no GPU needed):
+#   docker build -f scripts/Dockerfile.trt-build -t alpamayo-trt-build .
+#
+# 2) Produce the engine (needs the GPU + nvidia-container-toolkit); it lands in
+#    the mounted host directory, which you then point the native ROS node at:
+#   docker run --gpus all -e HF_TOKEN=$HF_TOKEN -v ~/autoware_data:/data \
+#       alpamayo-trt-build \
+#       python scripts/build_trt_expert_engine.py --output-dir /data/alpamayo/v0.1
+#   # -> /data/alpamayo/v0.1/expert_step.fp8.engine  (load it from the ROS node)
+#
+# NOTE: a TRT engine is not portable across TensorRT major versions — the native
+# ROS node must load it with a compatible `tensorrt` (+ torch) runtime.
+
+ARG CUDA_IMAGE=nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates build-essential ninja-build && \
+    rm -rf /var/lib/apt/lists/*
+
+# uv + Python 3.12 (managed by uv, independent of the system python)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+ENV VIRTUAL_ENV=/opt/venv
+RUN uv venv ${VIRTUAL_ENV} --python 3.12
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+WORKDIR /repo
+ENV PYTHONPATH=/repo/src
+COPY scripts/trt-build.lock.txt scripts/trt-build.lock.txt
+
+# torch/torchvision from the CUDA 13 index, then the pinned lock.
+# No flash-attn: the build loads the model with sdpa/eager attention, so the
+# (slow, RAM-hungry) flash-attn source compile is not needed at all.
+RUN uv pip install --index-url https://download.pytorch.org/whl/cu130 \
+        torch==2.12.0 torchvision==0.27.0 && \
+    uv pip install -r scripts/trt-build.lock.txt
+
+# Bring in the rest of the repo (src/, scripts/) last for better layer caching.
+COPY . /repo
+
+# Sanity-check imports at build time (no GPU); the actual engine build + its
+# native-vs-FP8 validation run at `docker run` (needs the GPU).
+RUN python -c "import torch, tensorrt, onnx, onnxscript, ml_dtypes; \
+import modelopt.torch.quantization; print('imports OK', torch.__version__, tensorrt.__version__)"
+
+CMD ["bash"]

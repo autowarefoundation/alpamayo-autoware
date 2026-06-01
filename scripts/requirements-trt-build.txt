@@ -1,27 +1,17 @@
-# Minimal Python 3.12 environment for TRT expert engine building.
-#
-# Why Python 3.12? The calibration step requires `physical_ai_av` which
-# needs Python >= 3.11, but ROS 2 Humble ships Python 3.10. Build the
-# engine in a separate 3.12 venv, then use the output ONNX in the
-# ROS 2 (3.10) runtime environment.
-#
-#   uv venv .venv-trt --python python3.12
-#   source .venv-trt/bin/activate
-#   uv pip install -r scripts/requirements-trt-build.txt
-#   python3 scripts/build_trt_expert_engine.py --output-dir /path/to/engines
-
-# Model loading
-torch>=2.8.0
+# Minimal DIRECT deps for building the FP8 TRT expert engine (Python 3.12).
+# Transitive closure is pinned in scripts/trt-build.lock.txt (uv pip compile).
+# torch/torchvision resolve from the CUDA 13 wheel index.
+# No flash-attn: the build loads the model with sdpa/eager attention, so the
+# flash-attn source compile is not needed (it is a known machine-freeze risk).
+torch==2.12.0
+torchvision==0.27.0
 transformers==4.57.1
-einops>=0.8.1
-hydra-core>=1.3.2
-flash-attn>=2.8.3
-scipy>=1.10.0
-
-# Calibration data
-physical_ai_av>=0.2.0
-
-# ONNX export + INT8 quantization
-onnx>=1.20.0,<1.21.0
-onnxruntime-gpu>=1.23.0
-neural-compressor==3.0
+einops==0.8.1
+hydra-core==1.3.2
+scipy==1.16.3
+numpy==2.3.5
+onnx==1.21.0
+ml_dtypes==0.5.4
+nvidia-modelopt==0.43.0
+tensorrt==11.0.0.114
+physical-ai-av==0.2.0
