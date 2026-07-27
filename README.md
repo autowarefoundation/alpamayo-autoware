@@ -7,7 +7,7 @@ ROS 2 node for [Alpamayo 1.5](https://huggingface.co/nvidia/Alpamayo-1.5-10B) en
 ## Architecture
 
 ```text
-Camera Topics (CompressedImage × 4)     Odometry Topic
+    Camera Topics (CompressedImage × 4)     Odometry Topic
         │                                      │
         ▼                                      ▼
 ┌─────────────────────────────────────────────────────┐
@@ -21,11 +21,14 @@ Camera Topics (CompressedImage × 4)     Odometry Topic
 │                    (native PyTorch or TRT FP16)     │
 │                                       │             │
 │                          Trajectory Decode          │
-└──────────────────────────┬──────────────────────────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-         Trajectory    CoT Text     Markers
+│                                                     │
+│  optional: use_flashdrive:=true ─────────────────┐  │
+│     (HTTP client; no in-process model load)      │  │
+└──────────────────────────┬───────────────────────┼──┘
+                           │                       │
+              ┌────────────┼────────────┐          ▼
+              ▼            ▼            ▼   FlashDrive sidecar
+         Trajectory    CoT Text     Markers  (Python 3.12 / z-lab)
 ```
 
 Image preprocessing runs entirely on GPU: `torchvision.io.decode_jpeg` →
@@ -40,6 +43,7 @@ incurred.
 |------|--------|--------|-----------|----------|
 | **Baseline** | PyTorch native | Nucleus (top_p=0.98) | 10 steps | Reference quality |
 | **Optimized** (default) | TRT FP16 engine | Greedy | 5–10 steps | Low-latency deployment |
+| **Optional FlashDrive** | z-lab FlashDrive sidecar (Py 3.12) | Greedy + DFlash | 8-step `euler_with_cache` (sidecar default) | Experimental lower-latency path; **default off** |
 
 Defaults are tuned for the optimized mode: 5-step diffusion +
 greedy decode + `output_logits = False` on the VLM rollout. Flip
@@ -68,6 +72,41 @@ GT path length = 46.64 m), same methodology as
 | GPU preproc + greedy + TRT expert + 10-step | 0.700s | 1.43 | ~1.3% |
 | GPU preproc + greedy + TRT expert + 5-step | 0.660s | 1.52 | ~1.8% |
 | **Full optimized** (GPU-resident preproc + greedy + TRT + 5-step) | **0.600s** | **1.67** | **~1.8%** |
+
+> **Note on `num_traj_samples`:** the ROS 2 node path used for the latency
+> column hardcodes `num_traj_samples=1`. The Trajectory Deviation column above
+> is reported with `num_traj_samples=6` on the Physical AI clip (README
+> methodology). Those two settings are independent.
+
+### Optional FlashDrive results (preliminary, default-off)
+
+Measured on **NVIDIA RTX PRO 5000 Blackwell (48 GB)** with the optional
+FlashDrive sidecar (`use_flashdrive:=true`). This path does **not** change the
+baseline / TRT rows above (`use_flashdrive:=false` remains the default).
+
+FlashDrive config: `z-lab/Alpamayo-1.5-10B` (+ DFlash draft), PARO/Marlin
+quantization path, greedy (`temperature=0`, `top_p=1`), `euler_with_cache`
+8-step diffusion, `FD_TORCH_COMPILE=max-autotune`, `FD_WARMUP=1` (~7 min
+compile warmup). Streaming window 0 = KV prefill; windows 1+ = trajectory.
+Physical AI clip matches the table above
+(`030c760c-ae38-49aa-9ad8-f5650a545d26 @ t0_us=5_100_000`, GT path length =
+46.64 m).
+
+**Latency** below is steady-state sidecar HTTP round-trip after warmup
+(smoke windows 2+, synthetic frames) — not Tier IV rosbag E2E, and not the
+first post-`/reset` window (that path recompiles encode/DFlash and is
+~0.7–0.9 s). **Trajectory Deviation** is `minADE / 46.64 m` on the Physical
+AI clip. These rows are therefore **not** a drop-in substitute for the
+0.600 s rosbag median above.
+
+| Configuration | Steady latency | Trajectory Deviation | GPU mem (post-warmup) |
+|---------------|----------------|----------------------|------------------------|
+| FlashDrive sidecar, `num_traj_samples=1`, `max_new_tokens=16` | **~0.22 s** | ~2.5–3.5% (minADE 1.15–1.64 m; single-sample) | ~16 GB |
+| FlashDrive sidecar, `num_traj_samples=6`, `max_new_tokens=64` | ~0.36–0.40 s | **~0.6–0.7%** (minADE 0.28–0.32 m; one run ~1.3%) | ~24 GB |
+
+Smoke test (`flashdrive_sidecar/smoke_test.py`): **PASS** (window0=prefill;
+N=1 steady ~0.22 s with traj `[1,64,3]`; N=6 steady ~0.37 s with traj
+`[6,64,3]`).
 
 ## Prerequisites
 
@@ -148,6 +187,30 @@ ros2 launch alpamayo_ros alpamayo.launch.py \
   use_greedy_decode:=true
 ```
 
+### Optional FlashDrive Mode (sidecar)
+
+FlashDrive cannot run inside the ROS 2 Humble (Python 3.10) process. Enable the
+default-off backend to forward payloads to a separate Python 3.12 sidecar. See
+[`src/alpamayo_ros/alpamayo_ros/flashdrive_sidecar/README.md`](src/alpamayo_ros/alpamayo_ros/flashdrive_sidecar/README.md)
+for build/run/smoke-test details.
+
+```bash
+# Terminal 1: start the sidecar (Docker or FlashDrive py3.12 env)
+# Terminal 2: ROS node
+ros2 launch alpamayo_ros alpamayo.launch.py \
+  use_flashdrive:=true \
+  flashdrive_url:=http://127.0.0.1:8710
+```
+
+Notes:
+
+- Baseline / TRT path is unchanged when `use_flashdrive:=false` (default).
+- Streaming window 0 is a KV prefill and publishes no trajectory that cycle.
+- FlashDrive decode/diffusion defaults differ from the optimized TRT path
+  (8-step `euler_with_cache` + DFlash vs 5-step TRT Euler); treat quality as a
+  measured delta. See **Optional FlashDrive results** above for Physical AI
+  numbers on the same calibration clip.
+
 ### Rosbag Replay Evaluation
 
 ```bash
@@ -172,6 +235,8 @@ ros2 bag play <bag_path> --clock --rate 0.5
 | `nav_text_topic` | `/alpamayo/nav_text` | Navigation text topic |
 | `inference_period_sec` | `0.1` | Inference trigger period |
 | `expert_onnx_path` | `""` | TRT expert ONNX path (empty = native PyTorch) |
+| `use_flashdrive` | `false` | Use FlashDrive Python 3.12 sidecar instead of in-process model |
+| `flashdrive_url` | `http://127.0.0.1:8710` | FlashDrive sidecar base URL |
 | `num_diffusion_steps` | `5` | Diffusion steps (10 = quality, 5 = speed) |
 | `use_greedy_decode` | `true` | Greedy decode (faster, deterministic) |
 | `top_p` | `0.98` | Nucleus sampling threshold |
@@ -209,10 +274,15 @@ Requires the `trt` dependency group: `uv sync --active --group trt`
 
 **Flash Attention issues** — Set `config.attn_implementation = "sdpa"` as fallback.
 
+**FlashDrive sidecar not healthy** — Confirm the Python 3.12 process is up,
+`/health` returns 200, and `flashdrive_url` matches host/port. First load +
+`torch.compile` warmup can take many minutes.
+
 ## References
 
 - [Alpamayo](https://github.com/NVlabs/alpamayo) — Model weights, training, evaluation
 - [alpamayo-autoware](https://github.com/autowarefoundation/alpamayo-autoware) — This repository
+- [FlashDrive](https://github.com/z-lab/flashdrive) — Optional accelerated Alpamayo runtime
 
 ## License
 

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -36,12 +37,160 @@ from alpamayo1_5 import helper
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 
 try:
+    from alpamayo_ros.flashdrive_sidecar import wire
+except ImportError:  # pragma: no cover - direct script execution
+    from flashdrive_sidecar import wire  # type: ignore
+
+try:
     import lanelet2
     from autoware_lanelet2_extension_python.projection import MGRSProjector
 
     _HAS_LANELET2 = True
 except ImportError:
     _HAS_LANELET2 = False
+
+
+class FlashDriveBackend:
+    """Thin HTTP client for the optional Python 3.12 FlashDrive sidecar.
+
+    Used only when ``use_flashdrive`` is true. The baseline in-process path is
+    unchanged. Window 0 (streaming prefill) returns ``None`` (no trajectory).
+    """
+
+    def __init__(self, node: "AlpamayoRosNode", url: str) -> None:
+        self._node = node
+        self._url = url.rstrip("/")
+        self._num_frames = node._num_frames
+        self._timeout = float(os.environ.get("FLASHDRIVE_TIMEOUT_SEC", "600"))
+        self._http = None
+        log = node.get_logger()
+        ready_wait = float(os.environ.get("FLASHDRIVE_READY_WAIT_SEC", "1800"))
+        log.info(f"FlashDrive sidecar: waiting for {self._url}/health (<= {ready_wait:.0f}s)...")
+        self._wait_ready(ready_wait)
+        try:
+            self._post("/reset", {}, {})
+            log.info("FlashDrive sidecar: stream reset OK.")
+        except Exception as exc:  # noqa: BLE001
+            log.warn(f"FlashDrive sidecar reset failed (continuing): {exc}")
+
+    def _wait_ready(self, timeout_sec: float) -> None:
+        import urllib.request
+
+        deadline = time.time() + timeout_sec
+        last_err: Optional[str] = None
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(self._url + "/health", timeout=10) as resp:
+                    if resp.status == 200:
+                        self._node.get_logger().info("FlashDrive sidecar: healthy.")
+                        return
+            except Exception as exc:  # noqa: BLE001
+                last_err = str(exc)
+            time.sleep(5.0)
+        raise RuntimeError(
+            f"FlashDrive sidecar not healthy within {timeout_sec:.0f}s "
+            f"(url={self._url}, last error={last_err})"
+        )
+
+    def _post(self, path: str, meta: dict, arrays: dict):
+        import http.client
+        from urllib.parse import urlparse
+
+        body = wire.encode(meta, arrays)
+        parsed = urlparse(self._url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 80
+        try:
+            if self._http is None:
+                self._http = http.client.HTTPConnection(host, port, timeout=self._timeout)
+            self._http.request(
+                "POST",
+                path,
+                body=body,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(len(body)),
+                    "Connection": "keep-alive",
+                },
+            )
+            resp = self._http.getresponse()
+            raw = resp.read()
+            if resp.status != 200:
+                raise RuntimeError(f"FlashDrive HTTP {resp.status}")
+            return wire.decode(raw)
+        except Exception:
+            try:
+                if self._http is not None:
+                    self._http.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._http = http.client.HTTPConnection(host, port, timeout=self._timeout)
+            self._http.request(
+                "POST",
+                path,
+                body=body,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(len(body)),
+                    "Connection": "keep-alive",
+                },
+            )
+            resp = self._http.getresponse()
+            raw = resp.read()
+            if resp.status != 200:
+                raise RuntimeError(f"FlashDrive HTTP {resp.status}")
+            return wire.decode(raw)
+        finally:
+            try:
+                wire.release_shm(meta, unlink=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def infer(self, payload: dict):
+        """Return ``(traj[T,3], rot[T,3,3], cot_text|None)`` or ``None`` on prefill."""
+        frames = payload["image_frames"]
+        meta = {
+            "num_frames_per_camera": int(self._num_frames),
+            "nav_text": payload.get("nav_text"),
+        }
+        img = frames.detach()
+        if img.device.type != "cpu":
+            img = img.to("cpu", non_blocking=False)
+        arrays = {
+            "image_frames": np.ascontiguousarray(img.numpy(), dtype=np.uint8),
+            "camera_indices": np.ascontiguousarray(
+                payload["camera_indices"].detach().cpu().numpy(), dtype=np.int64
+            ),
+            "ego_history_xyz": np.ascontiguousarray(
+                payload["ego_history_xyz"].detach().cpu().numpy(), dtype=np.float32
+            ),
+            "ego_history_rot": np.ascontiguousarray(
+                payload["ego_history_rot"].detach().cpu().numpy(), dtype=np.float32
+            ),
+        }
+        t0 = time.time()
+        resp_meta, resp_arrays = self._post("/predict", meta, arrays)
+        roundtrip_sec = time.time() - t0
+
+        status = resp_meta.get("status")
+        if status == "prefill":
+            return None
+        if status != "ok":
+            raise RuntimeError(f"FlashDrive sidecar error: {resp_meta.get('message')}")
+
+        tok = float(resp_meta.get("tokenize_sec", resp_meta.get("prep_sec", 0.0)))
+        model = float(resp_meta.get("model_sec", 0.0))
+        post = float(resp_meta.get("post_sec", 0.0))
+        server = float(resp_meta.get("server_sec", 0.0))
+        self._node.get_logger().info(
+            f"[PROFILER][flashdrive] roundtrip={roundtrip_sec * 1000:.0f}ms "
+            f"server={server * 1000:.0f}ms tokenize={tok * 1000:.0f}ms "
+            f"model={model * 1000:.0f}ms post={post * 1000:.0f}ms "
+            f"wire≈{max(0.0, roundtrip_sec - server) * 1000:.0f}ms"
+        )
+        traj_batch = np.ascontiguousarray(resp_arrays["traj_batch"], dtype=np.float32)
+        rot_batch = np.ascontiguousarray(resp_arrays["rot_batch"], dtype=np.float32)
+        return traj_batch[0], rot_batch[0], (resp_meta.get("cot") or None)
 
 
 class AlpamayoRosNode(Node):
@@ -85,6 +234,10 @@ class AlpamayoRosNode(Node):
         # ``scripts/build_trt_expert_engine.py`` to swap in a TrtExpertEngine
         # runtime for the 5-step diffusion inner loop.
         self.declare_parameter("expert_onnx_path", "")
+        # Optional FlashDrive sidecar (Python 3.12). Default OFF — baseline/TRT
+        # in-process path below is unchanged unless explicitly enabled.
+        self.declare_parameter("use_flashdrive", False)
+        self.declare_parameter("flashdrive_url", "http://127.0.0.1:8710")
 
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
@@ -187,6 +340,16 @@ class AlpamayoRosNode(Node):
         self.get_logger().info(f"Subscribed to route topic: {route_topic}")
 
         self._auto_timer = self.create_timer(inference_period, self._timer_callback)
+
+        # Optional FlashDrive sidecar: skip in-process model load entirely.
+        self._flashdrive: Optional[FlashDriveBackend] = None
+        if bool(self.get_parameter("use_flashdrive").value):
+            url = str(self.get_parameter("flashdrive_url").value)
+            self.get_logger().info(f"Backend: FLASHDRIVE sidecar @ {url}")
+            self._flashdrive = FlashDriveBackend(self, url)
+            self.get_logger().info("Alpamayo node ready (FlashDrive backend).")
+            return
+
         self.get_logger().info(
             f"Loading Alpamayo model {self.model_name} on device={self._device} dtype={self._dtype}"
         )
@@ -432,6 +595,9 @@ class AlpamayoRosNode(Node):
 
     def _run_inference(self, payload: dict) -> dict:
         start = time.time()
+        if self._flashdrive is not None:
+            return self._run_inference_flashdrive(payload, start)
+
         frames = payload["image_frames"]  # already on GPU (uint8) from GPU preproc
         messages = helper.create_message(
             frames.flatten(0, 1),
@@ -520,6 +686,41 @@ class AlpamayoRosNode(Node):
 
         duration = time.time() - start
         return {"duration_sec": duration, "num_poses": len(traj_msg.points)}
+
+    def _run_inference_flashdrive(self, payload: dict, start: float) -> dict:
+        """Publish path for the optional FlashDrive sidecar (default-off)."""
+        assert self._flashdrive is not None
+        out = self._flashdrive.infer(payload)
+        if out is None:
+            self._marker_pub.publish(MarkerArray())
+            return {"duration_sec": time.time() - start, "num_poses": 0}
+
+        traj_np, rot_np, cot_text = out
+        trajectory = torch.from_numpy(traj_np)
+        rotation = torch.from_numpy(rot_np)
+        traj_msg = self._to_autoware_trajectory(trajectory, rotation)
+        self._trajectory_pub.publish(traj_msg)
+
+        marker_array = self._trajectory_to_markers(trajectory)
+        self._marker_pub.publish(marker_array)
+
+        nav_text = payload.get("nav_text")
+        if nav_text:
+            nav_msg = String()
+            nav_msg.data = nav_text
+            self._nav_text_pub.publish(nav_msg)
+
+        if cot_text:
+            cot_msg = String()
+            cot_msg.data = cot_text
+            self._cot_pub.publish(cot_msg)
+
+            cot_stamped_msg = StringStamped()
+            cot_stamped_msg.stamp = traj_msg.header.stamp
+            cot_stamped_msg.data = cot_text
+            self._cot_stamped_pub.publish(cot_stamped_msg)
+
+        return {"duration_sec": time.time() - start, "num_poses": len(traj_msg.points)}
 
     def _to_autoware_trajectory(
         self,
