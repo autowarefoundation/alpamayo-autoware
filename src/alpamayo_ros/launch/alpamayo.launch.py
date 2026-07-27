@@ -1,4 +1,6 @@
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -15,6 +17,14 @@ def generate_launch_description() -> LaunchDescription:
     default_camera_indices = [0, 1, 2, 6]
     return LaunchDescription(
         [
+            DeclareLaunchArgument("use_flashdrive", default_value="false"),
+            DeclareLaunchArgument(
+                "flashdrive_url", default_value="http://127.0.0.1:8710"
+            ),
+            DeclareLaunchArgument("expert_onnx_path", default_value=""),
+            DeclareLaunchArgument("num_diffusion_steps", default_value="5"),
+            DeclareLaunchArgument("use_greedy_decode", default_value="true"),
+            DeclareLaunchArgument("use_sim_time", default_value="false"),
             Node(
                 package="alpamayo_ros",
                 executable="alpamayo_node",
@@ -30,6 +40,12 @@ def generate_launch_description() -> LaunchDescription:
                         "cot_topic": "/alpamayo/reasoning",
                         "cot_with_stamped_topic": "/alpamayo/reasoning_stamped",
                         "inference_period_sec": 1.0,
+                        "use_flashdrive": LaunchConfiguration("use_flashdrive"),
+                        "flashdrive_url": LaunchConfiguration("flashdrive_url"),
+                        "expert_onnx_path": LaunchConfiguration("expert_onnx_path"),
+                        "num_diffusion_steps": LaunchConfiguration("num_diffusion_steps"),
+                        "use_greedy_decode": LaunchConfiguration("use_greedy_decode"),
+                        "use_sim_time": LaunchConfiguration("use_sim_time"),
                     }
                 ],
             )
