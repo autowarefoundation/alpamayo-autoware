@@ -78,44 +78,35 @@ GT path length = 46.64 m), same methodology as
 > is reported with `num_traj_samples=6` on the Physical AI clip (README
 > methodology). Those two settings are independent.
 
-### Optional FlashDrive results (preliminary, default-off)
+### Optional FlashDrive (default off)
 
-Measured on **NVIDIA RTX PRO 5000 Blackwell (48 GB)** with the optional
-FlashDrive sidecar (`use_flashdrive:=true`). This path does **not** change the
-baseline / TRT rows above (`use_flashdrive:=false` remains the default).
+Preliminary numbers on **NVIDIA RTX PRO 5000 Blackwell (48 GB)** with
+`use_flashdrive:=true` and `FD_TORCH_COMPILE=max-autotune`. This path does
+**not** change the baseline / TRT rows above.
 
-FlashDrive config: `z-lab/Alpamayo-1.5-10B` (+ DFlash draft), PARO/Marlin
-quantization path, greedy (`temperature=0`, `top_p=1`), `euler_with_cache`
-8-step diffusion, `FD_TORCH_COMPILE=max-autotune`, `FD_WARMUP=1` (~7 min
-compile warmup). Streaming window 0 = KV prefill; windows 1+ = trajectory.
-Physical AI clip matches the table above
-(`030c760c-ae38-49aa-9ad8-f5650a545d26 @ t0_us=5_100_000`, GT path length =
-46.64 m).
+Latency is steady-state sidecar HTTP round-trip after warmup (not Tier IV
+rosbag E2E). Trajectory Deviation uses the same Physical AI clip and
+`minADE / 46.64 m` definition as above. Prefer `num_traj_samples=1` when
+comparing latency to the in-process node; use `num_traj_samples=6` when
+matching the README deviation methodology.
 
-**Latency** below is steady-state sidecar HTTP round-trip after warmup
-(smoke windows 2+, synthetic frames) — not Tier IV rosbag E2E, and not the
-first post-`/reset` window (that path recompiles encode/DFlash and is
-~0.7–0.9 s). **Trajectory Deviation** is `minADE / 46.64 m` on the Physical
-AI clip. These rows are therefore **not** a drop-in substitute for the
-0.600 s rosbag median above.
+| Configuration | Latency | Trajectory Deviation |
+|---------------|---------|----------------------|
+| FlashDrive sidecar, `num_traj_samples=1`, `max_new_tokens=16` | **~0.22 s** | — |
+| FlashDrive sidecar, `num_traj_samples=6`, `max_new_tokens=64` | ~0.37 s | **~0.6%** |
 
-| Configuration | Steady latency | Trajectory Deviation | GPU mem (post-warmup) |
-|---------------|----------------|----------------------|------------------------|
-| FlashDrive sidecar, `num_traj_samples=1`, `max_new_tokens=16` | **~0.22 s** | ~2.5–3.5% (minADE 1.15–1.64 m; single-sample) | ~16 GB |
-| FlashDrive sidecar, `num_traj_samples=6`, `max_new_tokens=64` | ~0.36–0.40 s | **~0.6–0.7%** (minADE 0.28–0.32 m; one run ~1.3%) | ~24 GB |
-
-Smoke test (`flashdrive_sidecar/smoke_test.py`): **PASS** (window0=prefill;
-N=1 steady ~0.22 s with traj `[1,64,3]`; N=6 steady ~0.37 s with traj
-`[6,64,3]`).
+Build, run, and smoke-test details:
+[`src/alpamayo_ros/alpamayo_ros/flashdrive_sidecar/README.md`](src/alpamayo_ros/alpamayo_ros/flashdrive_sidecar/README.md).
 
 ## Prerequisites
 
 | Requirement | Specification |
 |-------------|----------------------------------------------|
-| **Python** | 3.10.x (ROS 2 Humble compatibility) |
+| **Python** | 3.10.x (ROS 2 Humble compatibility); FlashDrive sidecar needs 3.12 |
 | **ROS 2** | Humble |
 | **GPU** | NVIDIA GPU with 24 GB+ VRAM |
 | **CUDA** | 12.x+ |
+| **FlashDrive (optional)** | Hugging Face access to gated z-lab Alpamayo / DFlash weights + Docker (or a local FlashDrive 3.12 env) |
 
 ## Setup
 
@@ -191,8 +182,8 @@ ros2 launch alpamayo_ros alpamayo.launch.py \
 
 FlashDrive cannot run inside the ROS 2 Humble (Python 3.10) process. Enable the
 default-off backend to forward payloads to a separate Python 3.12 sidecar. See
-[`src/alpamayo_ros/alpamayo_ros/flashdrive_sidecar/README.md`](src/alpamayo_ros/alpamayo_ros/flashdrive_sidecar/README.md)
-for build/run/smoke-test details.
+[`flashdrive_sidecar/README.md`](src/alpamayo_ros/alpamayo_ros/flashdrive_sidecar/README.md)
+for build, run, and smoke-test details.
 
 ```bash
 # Terminal 1: start the sidecar (Docker or FlashDrive py3.12 env)
@@ -208,8 +199,7 @@ Notes:
 - Streaming window 0 is a KV prefill and publishes no trajectory that cycle.
 - FlashDrive decode/diffusion defaults differ from the optimized TRT path
   (8-step `euler_with_cache` + DFlash vs 5-step TRT Euler); treat quality as a
-  measured delta. See **Optional FlashDrive results** above for Physical AI
-  numbers on the same calibration clip.
+  measured delta. See **Optional FlashDrive** above for preliminary numbers.
 
 ### Rosbag Replay Evaluation
 

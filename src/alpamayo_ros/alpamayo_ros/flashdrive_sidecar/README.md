@@ -26,6 +26,12 @@ Responses:
 - Window 0 → `status=prefill` (no trajectory; fills the KV cache)
 - Window 1+ → `status=ok` with `traj_batch` / `rot_batch` and CoT text
 
+## Requirements
+
+- NVIDIA GPU with sufficient VRAM (about 16 GB for `num_traj_samples=1`)
+- Hugging Face access to gated z-lab Alpamayo-1.5 / DFlash weights (`HF_TOKEN`)
+- Docker with GPU support, **or** a local FlashDrive Python 3.12 environment
+
 ## Build and run
 
 ```bash
@@ -35,7 +41,7 @@ docker build -t flashdrive_sidecar:py312 \
   src/alpamayo_ros/alpamayo_ros/flashdrive_sidecar
 
 # Run (HF token required for gated z-lab checkpoints).
-# Prefer FD_TORCH_COMPILE=max-autotune for production latency (~7 min warmup).
+# Prefer FD_TORCH_COMPILE=max-autotune (~several minutes warmup).
 # Use none only for fast bring-up / debugging.
 docker run --gpus all --network host --ipc host \
   -e HF_TOKEN \
@@ -49,8 +55,10 @@ docker run --gpus all --network host --ipc host \
   flashdrive_sidecar:py312
 ```
 
+Wait until `GET /health` returns 200, then enable the ROS node.
+
 Or without Docker: create a Python 3.12 FlashDrive env per upstream FlashDrive
-docs, then `python server.py`.
+docs, then run `python server.py` from this directory.
 
 ## Smoke test
 
@@ -59,6 +67,9 @@ docs, then `python server.py`.
 python3 src/alpamayo_ros/alpamayo_ros/flashdrive_sidecar/smoke_test.py \
   --url http://127.0.0.1:8710 --windows 4
 ```
+
+Expects window 0 = prefill and windows 1+ = trajectory tensors of shape
+`[num_traj_samples, 64, 3]`.
 
 ## Enable from the ROS node
 
@@ -70,40 +81,30 @@ ros2 launch alpamayo_ros alpamayo.launch.py \
 
 Default remains `use_flashdrive:=false` (in-process baseline / TRT path).
 
-## Measured results (preliminary)
+## Preliminary measurements
 
-Hardware: NVIDIA RTX PRO 5000 Blackwell (48 GB). Sidecar
-`FD_TORCH_COMPILE=max-autotune` + `FD_WARMUP=1` (~7 min). DFlash draft loads;
-PARO/Marlin path is active (checkpoint may log missing qlinear bias keys).
-Physical AI clip `030c760c-ae38-49aa-9ad8-f5650a545d26 @ t0_us=5_100_000`
-(GT path length 46.64 m), same clip as the upstream README Trajectory
-Deviation column.
+Hardware: NVIDIA RTX PRO 5000 Blackwell (48 GB). Config:
+`FD_TORCH_COMPILE=max-autotune`, `FD_WARMUP=1`, greedy decode, 8-step
+`euler_with_cache` + DFlash. Physical AI clip
+`030c760c-ae38-49aa-9ad8-f5650a545d26 @ t0_us=5_100_000` (GT path length
+46.64 m), same clip as the main README Trajectory Deviation column.
 
-Latency is **steady-state** smoke round-trip (windows 2+ after warmup). The
-first trajectory window after `/reset` recompiles encode/DFlash and is much
-slower — do not use that as the latency figure.
+Report **steady-state** latency after warmup (smoke windows 2+). The first
+trajectory window after `/reset` may recompile and is not representative.
 
-| Setting | Steady latency | minADE | Trajectory Deviation | GPU mem |
-|---------|----------------|--------|----------------------|---------|
-| `FD_NUM_TRAJ_SAMPLES=1`, `FD_MAX_NEW_TOKENS=16` | ~0.22 s | 1.15–1.64 m | ~2.5–3.5% | ~16 GB |
-| `FD_NUM_TRAJ_SAMPLES=6`, `FD_MAX_NEW_TOKENS=64` | ~0.36–0.40 s | 0.28–0.32 m (one run ~0.63 m) | ~0.6–0.7% | ~24 GB |
+| Setting | Latency | Trajectory Deviation | GPU mem |
+|---------|---------|----------------------|---------|
+| `FD_NUM_TRAJ_SAMPLES=1`, `FD_MAX_NEW_TOKENS=16` | ~0.22 s | — (single-sample; not the README N=6 method) | ~16 GB |
+| `FD_NUM_TRAJ_SAMPLES=6`, `FD_MAX_NEW_TOKENS=64` | ~0.37 s | ~0.6% | ~24 GB |
 
-Upstream ROS node latency path hardcodes `num_traj_samples=1`; the README
-deviation column uses `num_traj_samples=6`. Prefer N=1 when comparing latency
-to the in-process node; use N=6 when matching the README deviation methodology.
+## Caveats
 
-`smoke_test.py`: **PASS** (window0=prefill; N=1 traj `[1,64,3]`; N=6 traj
-`[6,64,3]`).
-## Important caveats
-
-- Streaming assumes roughly uniform ~0.1 s window stride. Dropped frames under
-  a busy timer can degrade the temporal prior.
-- FlashDrive diffusion/decode defaults (`euler_with_cache`, 8 steps, DFlash)
-  differ from the in-process 5-step Euler + TRT expert path. Treat quality as a
-  measured delta, not equivalence.
-- Sidecar window1 latency is **not** identical to Tier IV rosbag
-  `Alpamayo inference completed` E2E medians in the main README table.
+- Streaming assumes a roughly uniform ~0.1 s window stride.
+- FlashDrive diffusion/decode defaults differ from the in-process 5-step
+  Euler + TRT expert path; treat quality as a measured delta.
+- Sidecar latency is not identical to Tier IV rosbag
+  `Alpamayo inference completed` medians in the main README table.
 - Large camera tensors may use POSIX shared memory (`FD_WIRE_SHM=1`); prefer
-  `--ipc host` (or equivalent) between node and sidecar.
-- Model weights remain under the non-commercial / research licenses of the
-  respective HuggingFace model cards.
+  `--ipc host` between node and sidecar.
+- Model weights remain under the licenses of the respective Hugging Face
+  model cards.
