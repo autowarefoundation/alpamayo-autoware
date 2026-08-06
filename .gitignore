@@ -214,3 +214,24 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# colcon build products. The Python template above only covers build/, but a colcon
+# workspace also writes install/ and log/, and install/ embeds absolute paths from the
+# machine that built it.
+install/
+log/
+
+# Local virtual environments. The template covers .venv but not the per-generation ones
+# this repo's setup instructions and runner scripts create.
+.venv*/
+a1_5_venv/
+
+# TensorRT engines are built per GPU architecture and are not portable.
+engines_trt/
+
+# Local fine-tuning scratch space.
+finetune/
+
+# Alpamayo 2 Super demo recording: raw screen captures and the per-frame camera strip
+# are multi-GB intermediates. Commit only the finished GIF under images/.
+demo_recording/
