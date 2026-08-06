@@ -18,7 +18,10 @@ It differs from the 1.5 node in five ways that shape this file:
   trajectory it publishes is far too stale to close the loop on. Trajectory headers carry
   the *input* t0 stamp so consumers can measure that staleness.
 
-The TensorRT expert engine is unavailable for this generation.
+The TensorRT expert engine is unavailable for this generation. Navigation-instruction
+conditioning is available but **off by default** (``nav_cfg_enabled``): upstream declares
+classifier-free guidance unsupported for this checkpoint, and measurement here agrees that it
+perturbs the rollout by under a metre rather than steering it. See the README.
 """
 
 from __future__ import annotations
@@ -38,10 +41,15 @@ import rclpy  # noqa: E402
 import torch  # noqa: E402
 import torchvision  # noqa: E402
 from autoware_internal_debug_msgs.msg import StringStamped  # noqa: E402
-from autoware_planning_msgs.msg import Trajectory  # noqa: E402
+from autoware_planning_msgs.msg import LaneletRoute, Trajectory  # noqa: E402
 from nav_msgs.msg import Odometry  # noqa: E402
 from rclpy.node import Node  # noqa: E402
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
+from rclpy.qos import (  # noqa: E402
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from rclpy.time import Time  # noqa: E402
 from sensor_msgs.msg import CompressedImage  # noqa: E402
 from std_msgs.msg import String  # noqa: E402
@@ -53,7 +61,7 @@ from alpamayo2_super.input_profiles import (  # noqa: E402
     input_profile_record,
 )
 from alpamayo2_super.models.alpamayo2_super import Alpamayo2Super  # noqa: E402
-from alpamayo_ros import conversions  # noqa: E402
+from alpamayo_ros import conversions, nav_cfg, nav_text  # noqa: E402
 
 #: Camera IDs of the model's ``trajectory`` task profile. Ascending order is asserted
 #: inside the chat template, so the node validates it at startup instead.
@@ -113,6 +121,19 @@ class Alpamayo2RosNode(Node):
         # rollout, and the result looks like a path detached from the car.
         self.declare_parameter("drop_bad_trajectory", True)
         self.declare_parameter("seed", 0)
+
+        # --- Navigation classifier-free guidance (off by default) ---
+        # Upstream declares CFG unsupported for Alpamayo 2 Super, and measurement agrees that
+        # it is not a usable steering control -- see alpamayo_ros/nav_cfg.py for the mechanism
+        # and the README for the numbers. Enabling this doubles the VLM prefill and the
+        # per-step expert forward for a sub-metre change in the rollout, so it stays opt-in.
+        self.declare_parameter("nav_cfg_enabled", False)
+        self.declare_parameter("lanelet2_map_path", "")
+        self.declare_parameter("route_topic", "/planning/mission_planning/route")
+        self.declare_parameter("nav_text_topic", "/alpamayo/nav_text")
+        # Negative means "use the checkpoint's inference_guidance_weight" (3.0). 0 reduces
+        # to the unguided path, 1 to plain conditioning, above 1 extrapolates.
+        self.declare_parameter("nav_guidance_weight", -1.0)
 
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
@@ -201,6 +222,44 @@ class Alpamayo2RosNode(Node):
         self.create_subscription(Odometry, odom_topic, self._odometry_callback, odom_qos)
         self.get_logger().info(f"Subscribed to odometry topic: {odom_topic}")
 
+        # --- Navigation CFG setup ---
+        self._nav_cfg_enabled = bool(self.get_parameter("nav_cfg_enabled").value)
+        weight = float(self.get_parameter("nav_guidance_weight").value)
+        self._nav_guidance_weight = None if weight < 0.0 else weight
+        self._lanelet_map: Optional[dict] = None
+        self._route_lanelet_ids: List[int] = []
+        self._nav_text: Optional[str] = None
+        self._nav_text_pub = self.create_publisher(
+            String, self.get_parameter("nav_text_topic").value, queue_size
+        )
+        if self._nav_cfg_enabled:
+            map_path = self.get_parameter("lanelet2_map_path").value
+            if not map_path:
+                raise ValueError("nav_cfg_enabled requires lanelet2_map_path")
+            if not nav_text.HAS_LANELET2:
+                raise ValueError(
+                    "nav_cfg_enabled requires the lanelet2 Python bindings; source an "
+                    "Autoware workspace that provides autoware_lanelet2_extension_python."
+                )
+            self.get_logger().info(f"Loading lanelet2 map from {map_path} ...")
+            self._lanelet_map = nav_text.load_lanelet_map(map_path)
+            self.get_logger().info(f"Loaded {len(self._lanelet_map)} drivable lanelets.")
+            # The route is latched, so a late subscriber still needs transient-local.
+            route_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            route_topic = self.get_parameter("route_topic").value
+            self.create_subscription(LaneletRoute, route_topic, self._route_callback, route_qos)
+            weight_label = (
+                self._nav_guidance_weight if self._nav_guidance_weight is not None else "checkpoint"
+            )
+            self.get_logger().info(
+                f"Navigation CFG enabled (weight={weight_label}), route from {route_topic}"
+            )
+
         self._auto_timer = self.create_timer(inference_period, self._timer_callback)
 
         self._load_model()
@@ -222,6 +281,11 @@ class Alpamayo2RosNode(Node):
         self.get_logger().info("Alpamayo 2 Super model loaded and ready.")
 
     # --- Setup helpers ---
+
+    def _route_callback(self, msg: LaneletRoute) -> None:
+        """Store the ordered lanelet IDs the mission route follows."""
+        self._route_lanelet_ids = [seg.preferred_primitive.id for seg in msg.segments]
+        self.get_logger().info(f"Received route with {len(self._route_lanelet_ids)} segments.")
 
     def _validate_camera_config(self, topics: List[str], indices: List[int]) -> None:
         """Reject camera configurations the model cannot consume.
@@ -341,7 +405,9 @@ class Alpamayo2RosNode(Node):
         odom_history = list(self._odometry_buffer)[
             -self._num_history_steps * self.skip_num :: self.skip_num
         ]
-        ego_history_xyz, ego_history_rot, _ = conversions.build_ego_history(odom_history)
+        ego_history_xyz, ego_history_rot, positions_map = conversions.build_ego_history(
+            odom_history
+        )
         reference_speed = float(odom_history[-1].twist.twist.linear.x)
 
         history_ok, history_message = conversions.check_ego_history(
@@ -379,6 +445,8 @@ class Alpamayo2RosNode(Node):
             "input_profile": self._input_profile,
             "_t0_stamp": t0_time.to_msg(),
             "_reference_speed_mps": reference_speed,
+            # Map-frame position at t0, for the lanelet2 navigation lookup.
+            "_ego_pos_map": positions_map[-1],
         }
 
     def _downscale(self, images: torch.Tensor) -> torch.Tensor:
@@ -436,23 +504,66 @@ class Alpamayo2RosNode(Node):
             "ego_history_rot": payload["ego_history_rot"],
         }
 
+    def _resolve_nav_text(self, payload: dict) -> Optional[str]:
+        """Return the navigation instruction for this tick, or None to run unguided.
+
+        Navigation CFG needs both a map and a route; until the route arrives the node keeps
+        producing normal unguided rollouts rather than stalling.
+        """
+        if not self._nav_cfg_enabled:
+            return None
+        instruction = nav_text.compute_nav_text(
+            self._lanelet_map, self._route_lanelet_ids, payload["_ego_pos_map"]
+        )
+        if instruction is None:
+            self.get_logger().warn(
+                "Navigation CFG enabled but no route received yet; running unguided.",
+                throttle_duration_sec=10.0,
+            )
+            return None
+        if instruction != self._nav_text:
+            self._nav_text = instruction
+            self.get_logger().info(f"Navigation instruction: {instruction!r}")
+        nav_msg = String()
+        nav_msg.data = instruction
+        self._nav_text_pub.publish(nav_msg)
+        return instruction
+
     def _run_inference(self, payload: dict) -> dict:
         start = time.time()
 
-        model_inputs = helper.to_device(self._tokenize(payload), device=self._device)
+        instruction = self._resolve_nav_text(payload)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            # The third return value is a zeros placeholder upstream, not a confidence.
-            pred_xyz, pred_rot, _logprob, extra = self._model.sample_trajectories_from_data(
-                data=model_inputs,
-                top_p=self._top_p,
-                temperature=self._temperature,
-                num_traj_samples=1,
-                num_traj_sets=1,
-                max_generation_length=self._max_gen_len,
-                diffusion_kwargs={"inference_step": self._num_diffusion_steps},
-                return_extra=True,
+        if instruction is None:
+            model_inputs = helper.to_device(self._tokenize(payload), device=self._device)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # The third return value is a zeros placeholder upstream, not a confidence.
+                pred_xyz, pred_rot, _logprob, extra = self._model.sample_trajectories_from_data(
+                    data=model_inputs,
+                    top_p=self._top_p,
+                    temperature=self._temperature,
+                    num_traj_samples=1,
+                    num_traj_sets=1,
+                    max_generation_length=self._max_gen_len,
+                    diffusion_kwargs={"inference_step": self._num_diffusion_steps},
+                    return_extra=True,
+                )
+        else:
+            model_inputs = helper.to_device(
+                nav_cfg.tokenize_nav_prompts(
+                    payload, self._model, self._processor, instruction, device=self._device
+                ),
+                device=self._device,
             )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_xyz, pred_rot, _logprob, extra, _weight = nav_cfg.sample_with_nav_cfg(
+                    self._model,
+                    model_inputs,
+                    diffusion_steps=self._num_diffusion_steps,
+                    top_p=self._top_p,
+                    temperature=self._temperature,
+                    guidance_weight=self._nav_guidance_weight,
+                )
 
         trajectory = pred_xyz.detach().cpu()[0, 0, 0]  # (64, 3)
         rotation = pred_rot.detach().cpu()[0, 0, 0]  # (64, 3, 3)
