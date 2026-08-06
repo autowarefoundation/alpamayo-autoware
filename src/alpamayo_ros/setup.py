@@ -27,6 +27,7 @@ setup(
     entry_points={
         "console_scripts": [
             "alpamayo_node = alpamayo_ros.alpamayo_node:main",
+            "alpamayo2_node = alpamayo_ros.alpamayo2_node:main",
         ],
     },
 )
