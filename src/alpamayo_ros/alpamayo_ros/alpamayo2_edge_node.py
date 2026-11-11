@@ -13,10 +13,12 @@ Compared with the Alpamayo 2 Super node, which this one follows:
 * A navigation instruction is part of every prompt ("Turn right in 30m", "Continue
   straight"). It is derived from a lanelet2 map and the mission route when both are
   available, and is ``default_nav_text`` otherwise.
-* The model is called only through the upstream package's public API
+* The model is called through the upstream package's public API
   (``checkpoint.load_model``, ``helper.prepare_model_inputs``,
   ``sample_trajectories_from_data``), with upstream's optional ``torch.compile`` + CUDA-graph
-  acceleration (``accel``).
+  acceleration (``accel``). Two upstream functions are replaced in this process:
+  ``chat_template.relative_time_labels`` on Python 3.10, and ``helper.get_processor`` so the
+  processor is built once.
 * The output is the same as the Super node's, on the same topics: 64 waypoints at 0.1 s in
   the ego frame at t0, stamped with t0, plus RViz markers and the reasoning text.
 
@@ -31,6 +33,11 @@ import signal
 import sys
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Keep the compiled graphs (accel) across runs and reboots, under the launch file as well as
+# the run script; inductor's own default is in /tmp.
+_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "alpamayo2_edge")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_CACHE, "inductor"))
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_CACHE, "triton"))
 
 import time  # noqa: E402
 from concurrent.futures import Future, ThreadPoolExecutor  # noqa: E402
@@ -73,8 +80,10 @@ FRAME_OFFSETS_SEC: Dict[int, Sequence[float]] = {
 assert {c: len(o) for c, o in FRAME_OFFSETS_SEC.items()} == CAMERA_FRAME_COUNTS
 HISTORY_STEPS = 20
 STEP_SEC = 0.1
-#: How long camera and odometry messages are kept: the oldest frame is t0 - 2 s.
-BUFFER_SEC = 2.5
+#: How long camera and odometry messages are kept, behind each topic's newest. The oldest
+#: frame is t0 - 2 s, and t0 trails the newest odometry by the cameras' latency plus up to a
+#: frame period, which leaves 1.5 s for that.
+BUFFER_SEC = 3.5
 #: How far a history pose's odometry stamp may be from its scheduled time. Kinematic state
 #: normally runs at 50 Hz, so the nearest message is within 10 ms; more means a gap.
 ODOM_MATCH_TOLERANCE_SEC = 0.05
@@ -88,6 +97,7 @@ def _relative_time_labels(timestamps: torch.Tensor) -> List[str]:
     ``z`` turns a negative zero left by rounding into a positive one; at one decimal place
     that is exactly the string ``-0.0``. The labels, and so the prompt, are identical.
     """
+    timestamps = timestamps.reshape(-1)
     labels = []
     for delta in (timestamps - timestamps[-1]).tolist():
         text = f"{delta / 1_000_000:.1f}"
@@ -262,14 +272,17 @@ class Alpamayo2EdgeRosNode(Node):
                 history=HistoryPolicy.KEEP_LAST,
                 depth=1,
             )
-            route_topic = self.get_parameter("route_topic").value
-            self.create_subscription(LaneletRoute, route_topic, self._route_callback, route_qos)
+            self._route_topic = self.get_parameter("route_topic").value
+            self.create_subscription(
+                LaneletRoute, self._route_topic, self._route_callback, route_qos
+            )
         else:
             self.get_logger().info(
                 f"No lanelet2_map_path: every instruction is {self._default_nav_text!r}"
             )
 
         self._executor = ThreadPoolExecutor(max_workers=1)
+        self._stopping = False
         self._active_future: Optional[Future] = None
         self._load_model()
         seed = int(self.get_parameter("seed").value)
@@ -298,6 +311,8 @@ class Alpamayo2EdgeRosNode(Node):
             raise ValueError(
                 f"Alpamayo 2 Edge needs exactly the cameras {EDGE_CAMERA_IDS}, got {indices}."
             )
+        if len(set(topics)) != len(topics):
+            raise ValueError(f"camera_topics must be six different topics, got {topics}.")
 
     def _load_model(self) -> None:
         model_name = str(self.get_parameter("model_name").value)
@@ -364,6 +379,7 @@ class Alpamayo2EdgeRosNode(Node):
     # --- Callbacks ---
 
     def destroy_node(self) -> None:
+        self._stopping = True
         self._executor.shutdown(wait=False, cancel_futures=True)
         super().destroy_node()
 
@@ -375,8 +391,8 @@ class Alpamayo2EdgeRosNode(Node):
     def _append(buffer: List[tuple], stamp: int, item) -> None:
         """Add to a stamp-ordered buffer and drop what is older than BUFFER_SEC."""
         if buffer and stamp <= buffer[-1][0]:
-            if stamp == buffer[-1][0]:
-                return
+            if buffer[-1][0] - stamp < 1e9:
+                return  # a duplicate or a late message
             buffer.clear()  # time went back, e.g. a replayed bag started over
         buffer.append((stamp, item))
         while buffer[0][0] < stamp - BUFFER_SEC * 1e9:
@@ -506,6 +522,13 @@ class Alpamayo2EdgeRosNode(Node):
     def _resolve_nav_text(self, ego_pos_map) -> str:
         instruction = None
         if self._lanelet_map is not None:
+            if not self._route_lanelet_ids:
+                self.get_logger().warn(
+                    f"No route on {self._route_topic} yet, so the instruction is "
+                    f"{self._default_nav_text!r}. A replayed route needs the README's QoS "
+                    "override.",
+                    throttle_duration_sec=10.0,
+                )
             instruction = nav_text.compute_nav_text(
                 self._lanelet_map, self._route_lanelet_ids, ego_pos_map
             )
@@ -533,28 +556,47 @@ class Alpamayo2EdgeRosNode(Node):
             "camera_pixel_bounds": dict(CAMERA_PIXEL_BOUNDS),
         }
 
+    def _target_size(self, height: int, width: int, camera: int) -> tuple:
+        """The size upstream resizes a camera's frame to, from ``height`` x ``width``."""
+        lower, upper = CAMERA_PIXEL_BOUNDS[camera]
+        return tuple(
+            helper.smart_resize(
+                height, width, factor=self._resize_factor, min_pixels=lower, max_pixels=upper
+            )
+        )
+
     def _resize(self, frames: torch.Tensor) -> torch.Tensor:
         """All frames at the size upstream gives the front and telephoto cameras, on the GPU.
 
         Upstream resizes each frame on the CPU to its camera's pixel budget (front and
         telephoto ~192k px, the others ~96k). From the cameras' own resolution that took 0.66 s
         a call for 2880x1860 frames. Resized here first, the front and telephoto frames are
-        left as they are, and only the others are shrunk further on the CPU.
+        left as they are, and only the others are shrunk further on the CPU. That is done only
+        if the others then come out at the size upstream gives them from the cameras' own
+        resolution, as at 2880x1860 or 1920x1080 but not 1920x1280; otherwise their image
+        token grid would differ from upstream's, and upstream resizes the frames instead.
         """
         height, width = frames.shape[-2:]
-        lower, upper = CAMERA_PIXEL_BOUNDS[1]
-        size = helper.smart_resize(
-            height, width, factor=self._resize_factor, min_pixels=lower, max_pixels=upper
-        )
-        if tuple(size) == (height, width):
+        size = self._target_size(height, width, camera=1)
+        if size == (height, width) or (
+            self._target_size(*size, camera=0) != self._target_size(height, width, camera=0)
+        ):
             return frames
-        return (
-            torch.nn.functional.interpolate(
-                frames.float(), size=size, mode="bicubic", antialias=True, align_corners=False
-            )
-            .round_()
-            .clamp_(0, 255)
-            .to(torch.uint8)
+        # One frame at a time: all 22 in float32 would take 1.4 GB at 2880x1860.
+        return torch.cat(
+            [
+                torch.nn.functional.interpolate(
+                    frame[None].float(),
+                    size=size,
+                    mode="bicubic",
+                    antialias=True,
+                    align_corners=False,
+                )
+                .round_()
+                .clamp_(0, 255)
+                .to(torch.uint8)
+                for frame in frames
+            ]
         )
 
     def _sample_kwargs(self) -> dict:
@@ -604,6 +646,11 @@ class Alpamayo2EdgeRosNode(Node):
             "cot": cot_text or "",
         }
 
+        # The instruction the model was given, also when its rollout is dropped below.
+        nav_msg = String()
+        nav_msg.data = payload["nav_text"]
+        self._nav_text_pub.publish(nav_msg)
+
         traj_ok, traj_message = conversions.check_trajectory(
             trajectory, payload["_reference_speed_mps"]
         )
@@ -630,9 +677,6 @@ class Alpamayo2EdgeRosNode(Node):
                 ego_footprint=self._ego_footprint,
             )
         )
-        nav_msg = String()
-        nav_msg.data = payload["nav_text"]
-        self._nav_text_pub.publish(nav_msg)
         if cot_text:
             cot_msg = String()
             cot_msg.data = cot_text
@@ -647,7 +691,9 @@ class Alpamayo2EdgeRosNode(Node):
         try:
             metrics = future.result()
         except Exception as exc:
-            self.get_logger().error(f"Alpamayo 2 Edge inference failed: {exc!r}")
+            # An inference in flight at shutdown fails on the destroyed publishers.
+            if not self._stopping:
+                self.get_logger().error(f"Alpamayo 2 Edge inference failed: {exc!r}")
             return
         timing = (
             f"prepare {metrics['prepare_sec'] * 1e3:.0f} ms, "
@@ -675,9 +721,17 @@ def main(args: Optional[List[str]] = None) -> None:
         if rclpy.ok():
             raise
     finally:
-        # Ctrl-C under ros2 launch arrives twice, from the terminal and forwarded by launch.
-        # The second would interrupt the teardown below with a KeyboardInterrupt traceback.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        # Ctrl-C under ros2 launch arrives twice, from the terminal and forwarded by launch,
+        # and the second would interrupt the teardown below with a KeyboardInterrupt
+        # traceback. A Ctrl-C after that, while exit waits for an inference in flight (the
+        # first one compiles the graphs for minutes without a warm-up), stops at once.
+        teardown_started = time.monotonic()
+
+        def _on_sigint(signum, frame) -> None:
+            if time.monotonic() - teardown_started > 1.0:
+                os._exit(130)
+
+        signal.signal(signal.SIGINT, _on_sigint)
         # On Ctrl-C rclpy may already have torn the context down, in which case both of
         # these raise and bury the real shutdown reason in a traceback.
         try:
