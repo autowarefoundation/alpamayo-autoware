@@ -225,7 +225,6 @@ log/
 # this repo's setup instructions and runner scripts create.
 .venv*/
 a1_5_venv/
-a2e_venv/
 
 # TensorRT engines are built per GPU architecture and are not portable.
 engines_trt/
