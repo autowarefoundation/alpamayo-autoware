@@ -21,7 +21,9 @@ history and a navigation instruction ("Turn right in 30m"), it writes its drivin
 predicts 64 poses at 0.1 s intervals. It runs as `alpamayo2_edge_node`, beside the 1.5 and
 Super nodes, and calls NVIDIA's inference package
 ([`NVlabs/alpamayo2-edge`](https://github.com/NVlabs/alpamayo2-edge), vendored in
-[`src/alpamayo2_edge/`](src/alpamayo2_edge/)) through its public API only.
+[`src/alpamayo2_edge/`](src/alpamayo2_edge/)) through its public API. The vendored files are
+unmodified; the node replaces two of their functions in its own process, one for Python 3.10
+and one to build the processor once instead of on every call.
 
 | | Alpamayo 2 Super | Alpamayo 2 Edge |
 |---|---|---|
@@ -31,8 +33,8 @@ Super nodes, and calls NVIDIA's inference package
 | Ego history | 16 poses @ 10 Hz | 20 poses @ 10 Hz |
 | Navigation instruction | optional, experimental | part of every prompt |
 | Trajectory | 64 points / 6.4 s | 64 points / 6.4 s |
-| Inference (one call) | 3.35 s (RTX PRO 6000) | 0.23 s (RTX PRO 6000, `accel:=tuned`), see [Edge latency](#edge-latency) |
-| Peak VRAM | 69.1 GiB | 7.4 GiB |
+| Inference (one call) | 3.35 s (RTX PRO 6000) | 0.24 s (RTX PRO 6000, `accel:=tuned`), see [Edge latency](#edge-latency) |
+| Peak VRAM | 69.1 GiB | 6.1 GiB |
 
 ### Edge prerequisites
 
@@ -53,7 +55,7 @@ uv venv a2e_venv --python python3.10
 uv pip install --python a2e_venv/bin/python -r requirements-alpamayo2-edge.txt
 ```
 
-Optional, for the default `accel:=tuned` (three to five times faster): FlashAttention 2.8.3. Its
+Optional, for the default `accel:=tuned` (three to six times faster): FlashAttention 2.8.3. Its
 prebuilt wheel covers Ampere and Hopper GPUs:
 
 ```bash
@@ -83,9 +85,12 @@ Without FlashAttention the node runs eager PyTorch and says so at startup.
     -p lanelet2_map_path:=<map_dir>/lanelet2_map.osm \
     -p "warm_up_image_size:=[1860, 2880]"
 
-# Or through the launch file, which runs the node with the python3 on PATH. It needs a2e_venv
-# active and the vendored package on PYTHONPATH, as the script above sets up.
-colcon build --packages-select alpamayo_ros
+# Or through the launch file, which runs the node with the python3 on PATH. It needs ROS 2,
+# the Autoware workspace, a2e_venv and the vendored package on PYTHONPATH, as the script above
+# sets up.
+source /opt/ros/humble/setup.bash
+source ~/autoware/install/setup.bash  # your Autoware workspace
+colcon build --base-paths src --packages-select alpamayo_ros
 source install/setup.bash
 source a2e_venv/bin/activate
 export PYTHONPATH="$PWD/src:$PYTHONPATH"
@@ -128,11 +133,11 @@ route. A call starts when the previous one has ended and a newer camera frame is
 
 | | RTX PRO 6000, `accel:=tuned` (default) | RTX PRO 6000, `accel:=off` | H100, `accel:=tuned` | H100, `accel:=off` |
 |---|---|---|---|---|
-| Trajectories published | 1.6 Hz | 0.98 Hz | 2.2 Hz | 0.73 Hz |
-| Input preparation per call (JPEG decode, resize, prompt) | 0.39 s | 0.42 s | 0.16 s | 0.11 s |
-| Model per call (reasoning and trajectory) | 0.23 s | 0.68 s | 0.26 s | 1.28 s |
-| Peak VRAM | 7.4 GiB | 7.0 GiB | 7.5 GiB | 7.0 GiB |
-| Start to ready | 32 s | 12 s | 31 s | 19 s |
+| Trajectories published | 1.6 Hz | 0.94 Hz | 2.0 Hz | 0.73 Hz |
+| Input preparation per call (JPEG decode, resize, prompt) | 0.38 s | 0.46 s | 0.16 s | 0.09 s |
+| Model per call (reasoning and trajectory) | 0.24 s | 0.68 s | 0.25 s | 1.44 s |
+| Peak VRAM | 6.1 GiB | 6.1 GiB | 6.2 GiB | 6.1 GiB |
+| Start to ready | 24 s | 11 s | 34 s | 16 s |
 
 With `accel:=tuned`, start to ready includes building the graphs from the compiler cache; the
 first start, without one, took about 1.5 min on both GPUs. The model time varies with the length
@@ -156,6 +161,7 @@ preparation is upstream's preprocessing, on the CPU, which the rosbag replay sha
 | `inference_period_sec` | `0.05` | How often to check for a new input; a call starts when the previous one has ended and a newer frame is in |
 | `max_generation_length` | `256` | Reasoning token budget |
 | `num_diffusion_steps` | `10` | Flow-matching Euler steps (the checkpoint's) |
+| `top_p`, `temperature`, `seed` | `0.98`, `0.6`, `0` | Reasoning sampling (upstream's defaults) and the seed set once at startup |
 | `frame_match_tolerance_sec` | `0.06` | How far a frame may be from its scheduled time |
 | `lanelet2_map_path` | `""` | lanelet2 map for the navigation instruction |
 | `route_topic` | `/planning/mission_planning/route` | Mission route, latched (transient-local) |
