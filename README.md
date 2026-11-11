@@ -1,13 +1,10 @@
 # Alpamayo ROS 2 Node Usage Guide
 
-![Alpamayo Autoware Demo](images/alpamayo-autoware.gif)
-
 This guide explains how to set up and run the Alpamayo ROS 2 node.
 
-This branch adds a node for **Alpamayo 2 Edge**, described first below, to the
-`alpamayo2.0-super` branch. The Alpamayo 1.5 and [Alpamayo 2 Super](#alpamayo-2-super) nodes
-below are unchanged. The TensorRT-accelerated Alpamayo 1.5 node lives on the `alpamayo1.5`
-branch.
+This branch adds a node for **Alpamayo 2 Edge**, described first below. The
+[Alpamayo 1.5](#alpamayo-15) and [Alpamayo 2 Super](#alpamayo-2-super) nodes below are
+unchanged. The TensorRT-accelerated Alpamayo 1.5 node lives on the `alpamayo1.5` branch.
 
 ## Alpamayo 2 Edge
 
@@ -167,6 +164,13 @@ preparation is upstream's preprocessing, on the CPU, which the rosbag replay sha
 | `skip_on_bad_history` | `true` | Skip the tick when the ego history fails its invariants |
 | `drop_bad_trajectory` | `true` | Drop rollouts whose waypoints do not start at the vehicle |
 | `marker_z_offset`, `ego_footprint` | `0.4`, `[4.77, 1.73, 1.03]` | As for the Super node |
+
+## Alpamayo 1.5
+
+![Alpamayo 1.5 demo](images/alpamayo-autoware.gif)
+
+The sections from here to [Alpamayo 2 Super](#alpamayo-2-super) set up and run the Alpamayo 1.5
+node, `alpamayo_node`.
 
 ## Prerequisites
 
