@@ -4,9 +4,162 @@
 
 This guide explains how to set up and run the Alpamayo ROS 2 node.
 
-This branch adds a second node for **Alpamayo 2 Super** on top of `main`; see
-[Alpamayo 2 Super](#alpamayo-2-super) below. The TensorRT-accelerated Alpamayo 1.5 node lives
-on the `alpamayo1.5` branch.
+This branch adds a node for **Alpamayo 2 Edge**, described first below, to the
+`alpamayo2.0-super` branch. The Alpamayo 1.5 and [Alpamayo 2 Super](#alpamayo-2-super) nodes
+below are unchanged. The TensorRT-accelerated Alpamayo 1.5 node lives on the `alpamayo1.5`
+branch.
+
+## Alpamayo 2 Edge
+
+[Alpamayo 2 Edge](https://huggingface.co/nvidia/Alpamayo2-Edge) is a 2B reasoning
+vision-language-action model built on the Cosmos3-Edge backbone. From six cameras, the ego
+history and a navigation instruction ("Turn right in 30m"), it writes its driving reasoning and
+predicts 64 poses at 0.1 s intervals. It runs as `alpamayo2_edge_node`, beside the 1.5 and
+Super nodes, and calls NVIDIA's inference package
+([`NVlabs/alpamayo2-edge`](https://github.com/NVlabs/alpamayo2-edge), vendored in
+[`src/alpamayo2_edge/`](src/alpamayo2_edge/)) through its public API only.
+
+| | Alpamayo 2 Super | Alpamayo 2 Edge |
+|---|---|---|
+| Parameters | 34B | 2B |
+| Weights on disk | ~72 GB | ~4.9 GB |
+| Cameras | 6, IDs `(0, 1, 2, 3, 5, 6)`, 4 frames each | the same 6; front and telephoto 5 frames (-2 to 0 s), the others 3 (-1 to 0 s) |
+| Ego history | 16 poses @ 10 Hz | 20 poses @ 10 Hz |
+| Navigation instruction | optional, experimental | part of every prompt |
+| Trajectory | 64 points / 6.4 s | 64 points / 6.4 s |
+| Inference (one call) | 3.35 s (RTX PRO 6000) | 0.23 s (RTX PRO 6000, `accel:=tuned`), see [Edge latency](#edge-latency) |
+| Peak VRAM | 69.1 GiB | 7.4 GiB |
+
+### Edge prerequisites
+
+| Requirement | Specification |
+|---|---|
+| **GPU** | An NVIDIA GPU with BF16 support. Upstream recommends **16 GB+** of memory. |
+| **ROS 2** | Humble (Python 3.10) |
+| **Autoware** | A built Autoware workspace: the node imports `autoware_planning_msgs` and `autoware_internal_debug_msgs`, and the navigation instruction needs `autoware_lanelet2_extension_python`. |
+| **Disk** | ~5 GB for the weights, plus the Hugging Face cache. |
+
+### Edge setup
+
+Edge needs Transformers 5.17, which cannot share the 1.5/Super environment (4.57), so it gets
+its own Python 3.10 environment. The weights are public; no Hugging Face login is needed.
+
+```bash
+uv venv a2e_venv --python python3.10
+uv pip install --python a2e_venv/bin/python -r requirements-alpamayo2-edge.txt
+```
+
+Optional, for the default `accel:=tuned` (three to five times faster): FlashAttention 2.8.3. Its
+prebuilt wheel covers Ampere and Hopper GPUs:
+
+```bash
+uv pip install --python a2e_venv/bin/python --no-deps \
+    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl"
+```
+
+That wheel has no kernels for Blackwell GPUs (`sm_120`, such as the RTX PRO 6000 or RTX 50
+series). There, build it from source with the CUDA 12.8 toolkit (`nvcc` on `PATH` or
+`CUDA_HOME`). `FLASH_ATTENTION_FORCE_BUILD` keeps its build from fetching that same wheel, and
+`--no-cache` from reusing one; the build takes a while:
+
+```bash
+uv pip install --python a2e_venv/bin/python setuptools wheel packaging ninja
+FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS=120 MAX_JOBS=8 \
+    uv pip install --python a2e_venv/bin/python --no-deps --no-build-isolation --no-cache \
+    flash-attn==2.8.3
+```
+
+Without FlashAttention the node runs eager PyTorch and says so at startup.
+
+### Running the Edge node
+
+```bash
+# From the repository root. AUTOWARE_WS defaults to ~/autoware; VENV to a2e_venv.
+./run_alpamayo2_edge_node.sh \
+    -p lanelet2_map_path:=<map_dir>/lanelet2_map.osm \
+    -p "warm_up_image_size:=[1860, 2880]"
+
+# Or through the launch file, which runs the node with the python3 on PATH. It needs a2e_venv
+# active and the vendored package on PYTHONPATH, as the script above sets up.
+colcon build --packages-select alpamayo_ros
+source install/setup.bash
+source a2e_venv/bin/activate
+export PYTHONPATH="$PWD/src:$PYTHONPATH"
+ros2 launch alpamayo_ros alpamayo2_edge.launch.py use_sim_time:=true \
+    lanelet2_map_path:=<map_dir>/lanelet2_map.osm warm_up_image_size:="[1860, 2880]"
+```
+
+Both use the same camera topics as the Super node (the reference Autoware sensor set;
+`alpamayo2.launch.py` says how each topic was matched) and `use_sim_time:=true`, for a rosbag
+replayed with `--clock`. On live topics, give the script `-p use_sim_time:=false` and leave
+`use_sim_time` out of the launch command. The first start downloads the weights.
+
+- **Navigation.** With `lanelet2_map_path` and a mission route on `route_topic`, the instruction
+  follows the route (`alpamayo_ros/nav_text.py`, shared with the 1.5 node). Without a map, or
+  until a route arrives, it is `default_nav_text` ("Continue straight"). The instruction in use
+  is published on `/alpamayo/nav_text`. A recorded route usually replays as `VOLATILE`; see the
+  QoS override under [Navigation conditioning](#navigation-conditioning-optional-experimental).
+- **Acceleration.** `accel:=tuned` compiles the prompt prefill, the reasoning decode and the
+  flow-matching loop with `torch.compile` and CUDA graphs (upstream's `alpamayo2_edge.accel`).
+  The graphs are built per camera resolution: `warm_up_image_size` (height, width) builds them
+  at startup, before the node reports ready; otherwise the first input builds them. The compiler
+  cache is kept in `~/.cache/alpamayo2_edge`, which makes later starts faster. `accel:=off` runs
+  eager PyTorch.
+- **Reasoning.** On routine driving the model often writes `<NOMINAL>` instead of an
+  explanation; the node publishes the text as the model writes it.
+- **Cameras.** All six cameras must have the same resolution. Each scheduled frame is the
+  camera's nearest within `frame_match_tolerance_sec` of its time, and t0 is the oldest of the
+  cameras' newest frames.
+
+The outputs are the Super node's, on the same topics (see [Output Topics](#output-topics) and
+[Visualizing in RViz](#visualizing-in-rviz)), so do not run both nodes at once. Trajectories are
+in `base_link` at t0 and stamped with t0. This is a visualization/research node: it does not
+feed Autoware's planning stack.
+
+### Edge latency
+
+Measured on one RTX PRO 6000 Blackwell Max-Q (96 GB) and on one H100 (80 GB), replaying a 57 s
+Autoware rosbag in real time (six cameras at 2880x1860 and 10 Hz) with its lanelet2 map and
+route. A call starts when the previous one has ended and a newer camera frame is in.
+
+| | RTX PRO 6000, `accel:=tuned` (default) | RTX PRO 6000, `accel:=off` | H100, `accel:=tuned` | H100, `accel:=off` |
+|---|---|---|---|---|
+| Trajectories published | 1.6 Hz | 0.98 Hz | 2.2 Hz | 0.73 Hz |
+| Input preparation per call (JPEG decode, resize, prompt) | 0.39 s | 0.42 s | 0.16 s | 0.11 s |
+| Model per call (reasoning and trajectory) | 0.23 s | 0.68 s | 0.26 s | 1.28 s |
+| Peak VRAM | 7.4 GiB | 7.0 GiB | 7.5 GiB | 7.0 GiB |
+| Start to ready | 32 s | 12 s | 31 s | 19 s |
+
+With `accel:=tuned`, start to ready includes building the graphs from the compiler cache; the
+first start, without one, took about 1.5 min on both GPUs. The model time varies with the length
+of the reasoning it writes.
+
+Most of the input preparation is decoding the 22 JPEG frames, which the node does with nvJPEG.
+On the H100, nvJPEG uses the GPU's hardware JPEG decoder. It has no hardware backend for the
+RTX PRO 6000, where it decodes partly on the CPU, at about 24 ms a frame. The rest of the input
+preparation is upstream's preprocessing, on the CPU, which the rosbag replay shared.
+
+### Alpamayo 2 Edge parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `model_name` | `nvidia/Alpamayo2-Edge` | Hugging Face model ID or local directory |
+| `model_revision` | `f8951d09…` | Checkpoint revision (upstream's pinned one); ignored for a local directory |
+| `camera_topics` | six topics | One per camera ID, same order as `camera_indices` |
+| `camera_indices` | `[0, 1, 2, 3, 5, 6]` | Must be these six IDs |
+| `accel` | `tuned` | `tuned` / `compile` (need FlashAttention 2) or `off` |
+| `warm_up_image_size` | `[0, 0]` | Camera (height, width) to build the accelerated graphs for at startup |
+| `inference_period_sec` | `0.05` | How often to check for a new input; a call starts when the previous one has ended and a newer frame is in |
+| `max_generation_length` | `256` | Reasoning token budget |
+| `num_diffusion_steps` | `10` | Flow-matching Euler steps (the checkpoint's) |
+| `frame_match_tolerance_sec` | `0.06` | How far a frame may be from its scheduled time |
+| `lanelet2_map_path` | `""` | lanelet2 map for the navigation instruction |
+| `route_topic` | `/planning/mission_planning/route` | Mission route, latched (transient-local) |
+| `default_nav_text` | `Continue straight` | Instruction without a map or route |
+| `max_frame_age_sec` | `3.0` | Skip inference on stale buffers, e.g. after a replay ends |
+| `skip_on_bad_history` | `true` | Skip the tick when the ego history fails its invariants |
+| `drop_bad_trajectory` | `true` | Drop rollouts whose waypoints do not start at the vehicle |
+| `marker_z_offset`, `ego_footprint` | `0.4`, `[4.77, 1.73, 1.03]` | As for the Super node |
 
 ## Prerequisites
 
@@ -376,15 +529,18 @@ ros2 bag play <bag_dir> --clock --start-offset 0 --qos-profile-overrides-path ro
 ## License and Disclaimer
 
 - Inference code: Apache License 2.0
-- Model weights: Non-commercial license
+- Model weights: Non-commercial license (Alpamayo 1.5, Alpamayo 2 Super);
+  [OpenMDW-1.1](https://openmdw.ai/license/1-1/) (Alpamayo 2 Edge)
 
 For details, see the HuggingFace model cards for
-[Alpamayo-1.5-10B](https://huggingface.co/nvidia/Alpamayo-1.5-10B) and
-[Alpamayo2-Super](https://huggingface.co/nvidia/Alpamayo2-Super).
+[Alpamayo-1.5-10B](https://huggingface.co/nvidia/Alpamayo-1.5-10B),
+[Alpamayo2-Super](https://huggingface.co/nvidia/Alpamayo2-Super) and
+[Alpamayo2-Edge](https://huggingface.co/nvidia/Alpamayo2-Edge).
 
-[`src/alpamayo2_super/`](src/alpamayo2_super/) is a vendored copy of NVIDIA's Apache-2.0
-inference package, with the per-file SPDX headers preserved; see
-[`src/alpamayo2_super/UPSTREAM.md`](src/alpamayo2_super/UPSTREAM.md) for the upstream commit and
-the deviations from it.
+[`src/alpamayo2_super/`](src/alpamayo2_super/) and [`src/alpamayo2_edge/`](src/alpamayo2_edge/)
+are vendored copies of NVIDIA's Apache-2.0 inference packages, with the per-file SPDX headers
+preserved; see [`src/alpamayo2_super/UPSTREAM.md`](src/alpamayo2_super/UPSTREAM.md) and
+[`src/alpamayo2_edge/UPSTREAM.md`](src/alpamayo2_edge/UPSTREAM.md) for the upstream commits and
+the deviations from them.
 
 Alpamayo is a family of pre-trained reasoning models for research purposes and is not a complete autonomous driving stack. It is not intended for use in production environments.
