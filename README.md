@@ -11,6 +11,13 @@ branch.
 
 ## Alpamayo 2 Edge
 
+![Alpamayo 2 Edge demo](images/alpamayo2-edge-autoware.gif)
+
+*Four of the six camera views the model consumes, its reasoning, and the 6.4 s trajectory it
+predicts, at a red light before a left turn, over a replayed Autoware rosbag. The predictions
+were recorded on an RTX PRO 6000 with the bag replayed in real time, about 1.5 a second; each is
+drawn at the time of its input, without the ~0.8 s it took to publish.*
+
 [Alpamayo 2 Edge](https://huggingface.co/nvidia/Alpamayo2-Edge) is a 2B reasoning
 vision-language-action model built on the Cosmos3-Edge backbone. From six cameras, the ego
 history and a navigation instruction ("Turn right in 30m"), it writes its driving reasoning and
